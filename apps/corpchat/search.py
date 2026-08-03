@@ -85,15 +85,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("corpchat-search")
 
-# ── 检测 GrandCypher / 图查询是否可用 ──────────────────────
-_GRAPH_CYPHER_AVAILABLE: bool = False
-try:
-    import grandcypher
-    _GRAPH_CYPHER_AVAILABLE = True
-except ImportError:
-    _GRAPH_CYPHER_AVAILABLE = False
-
-
 # ═══════════════════════════════════════════════════════════════════
 # 1. 配置与常量
 #    参考 analysis_report.md §2.2 (分块), §2.8 (RRF), §2.7 (权重)
@@ -323,6 +314,7 @@ class IndexBuilder:
                     "servicer_userid": msg["servicer_userid"],
                     "label": msg["label"],
                     "customer_name": msg["customer_name"],
+                    "company": msg.get("company"),
                     "open_kfid": msg["open_kfid"],
                     "origin": msg["origin"],
                     "chunk_index": i,
@@ -585,80 +577,7 @@ class Reranker:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 5. LLM 关系提取 (辅助)
-# ═══════════════════════════════════════════════════════════════════
-
-def _extract_relations_with_llm(
-    embeddings: txtai.Embeddings,
-    docs: List[Tuple],
-    sample_size: int = 15,
-) -> None:
-    graph = embeddings.graph
-    if not graph:
-        logger.warning("图未启用, 跳过 LLM 关系提取")
-        return
-
-    import random
-    import requests
-
-    sampled = random.sample(docs, min(sample_size, len(docs)))
-
-    prompt_template = (
-        "Extract entity-relationship triples from the following chat message.\n"
-        "Entities: person names/user IDs/companies/topics/labels.\n"
-        "Relations: DISCUSSES, SENT_TO, FROM, MENTIONS, RELATED_TO.\n"
-        "Return ONLY a JSON array of triples, no markdown.\n"
-        'Example: [{"source":"user_john","relation":"DISCUSSES","target":"investment"}]\n\n'
-        "Message:\n{text}\n\nJSON:"
-    )
-
-    total_edges = 0
-    for msgid, text, _tags_json in sampled:
-        try:
-            truncated = text[:1500]
-            prompt = prompt_template.format(text=truncated)
-
-            url = f"{LITELLM_BASE_URL}/chat/completions"
-            resp = requests.post(
-                url,
-                json={
-                    "model": LITELLM_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 300,
-                },
-                headers={
-                    "Authorization": f"Bearer {LITELLM_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-            triples = json.loads(raw)
-            for t in triples:
-                src = t.get("source", "").strip()
-                rel = t.get("relation", "RELATED_TO").strip().upper()
-                tgt = t.get("target", "").strip()
-                if src and tgt:
-                    graph.add_edge((src, rel, tgt))
-                    total_edges += 1
-
-            logger.debug(f"  从 {msgid[:20]}... 提取 {len(triples)} 条关系")
-
-        except Exception as e:
-            logger.debug(f"LLM 关系提取失败 for {msgid[:30]}: {e}")
-            continue
-
-    logger.info(f"LLM 关系提取完成: 共添加 {total_edges} 条边")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 6. 搜索器 (Searcher)
+# 5. 搜索器 (Searcher)
 #    实现混合搜索 + RRF 融合 + 图扩展 + 重排序
 #    参考 §2.5 (混合搜索), §2.6 (重排序), §2.8 (RRF 融合)
 # ═══════════════════════════════════════════════════════════════════
@@ -708,7 +627,8 @@ class Searcher:
     # ── 图扩展 (纯结构, 直接 backend API) ──────────────────────
     def _graph_expand(self, results: List[Dict], max_expand: int = 3,
                        hop_discount: float = 0.8, limit: int = 20,
-                       query: str = "") -> List[Dict]:
+                       query: str = "", label_filter: Optional[str] = None,
+                       date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict]:
         """
         从 base 结果出发, 遍历 4 种 traversal-eligible 结构边,
         将邻居追加到 base 结果下方 (不重排 base).
@@ -731,6 +651,30 @@ class Searcher:
             "same_conversation", "sender_receiver",
             "same_sender", "same_company",
         }
+
+        # Query-consistency gate: run the query search ONCE, build id -> score map.
+        # Avoids an N+1 full search per neighbor.
+        query_scores: Dict[str, float] = {}
+        if query:
+            try:
+                q_raw = self.embeddings.search(_segment(query), limit=MAX_SEARCH_LIMIT)
+                for item in q_raw:
+                    parsed = self._parse_txtai_result(item)
+                    if parsed:
+                        query_scores[parsed["id"]] = parsed.get("score", 0.0)
+            except Exception:
+                query_scores = {}
+
+        def _passes_filters(doc: Dict) -> bool:
+            meta = doc.get("metadata", {})
+            if label_filter and meta.get("label") != label_filter:
+                return False
+            send_time = meta.get("send_time", "")
+            if date_from and send_time and str(send_time) < date_from:
+                return False
+            if date_to and send_time and str(send_time) > date_to:
+                return False
+            return True
 
         expanded_ids = {r["id"] for r in results}
         expanded = list(results)
@@ -759,22 +703,8 @@ class Searcher:
                 if not neighbor_id or neighbor_id in expanded_ids:
                     continue
 
-                # Query-consistency gate: score the neighbor against the query itself.
-                # Use a generous limit so relevant neighbors are not zeroed out just
-                # because they rank below top-3 globally.
-                neighbor_query_relevance = 0.0
-                if query:
-                    try:
-                        q_raw = self.embeddings.search(
-                            _segment(query), limit=50,
-                        )
-                        for item in q_raw:
-                            parsed = self._parse_txtai_result(item)
-                            if parsed and parsed["id"] == neighbor_id:
-                                neighbor_query_relevance = parsed.get("score", 0.0)
-                                break
-                    except Exception:
-                        neighbor_query_relevance = 0.0
+                # Query-consistency gate: look up the precomputed relevance score.
+                neighbor_query_relevance = query_scores.get(neighbor_id, 0.0)
 
                 final_score = r.get("score", 0.0) * hop_discount * neighbor_query_relevance
                 if final_score <= 0.0:
@@ -786,7 +716,7 @@ class Searcher:
                     continue
 
                 # Re-apply label/date filters
-                if not self._filter_doc(neighbor_doc):
+                if not _passes_filters(neighbor_doc):
                     continue
 
                 expanded_ids.add(neighbor_id)
@@ -807,12 +737,6 @@ class Searcher:
         extra_part.sort(key=lambda x: x.get("score", 0), reverse=True)
         return (base_part + extra_part)[:limit]
 
-    @staticmethod
-    def _filter_doc(doc: Dict) -> bool:
-        """Apply the same label/date filter logic used in search()."""
-        meta = doc.get("metadata", {})
-        return True  # Filters are applied at search()-time via _filter(); kept here for standalone use
-
     # ── 从 txtai 获取单个文档并提取 metadata ───────────────
     @staticmethod
     def _parse_txtai_result(item: Any) -> Optional[Dict]:
@@ -823,9 +747,9 @@ class Searcher:
           - dict: {id, text, score, tags(optional)}
           - tuple: (id, text, tags_json, score)
         
-        注意: 即使 index 时传入了 tags_json, txtai 在 content=True 且 
-        objects=True 的配置下, 返回的 dict 中通常没有 tags 字段。
-        所以 metadata 必须从 enriched text 的 "Metadata: ..." 后缀中反向解析。
+        注意: txtai 在 content=True 且 objects=True 的配置下, search() 返回的
+        dict 中不包含 tags 字段。metadata 通过 _fetch_one_doc 从 sections.tags
+        列按 id 查询获取 (见 _fetch_one_doc)。
         """
         doc_id = ""
         text = ""
@@ -955,10 +879,14 @@ class Searcher:
                         output.append(parsed)
 
             if graph_expand > 0 and self.embeddings.graph:
-                output = self._graph_expand(output[:limit], max_expand=3, limit=limit * 2, query=query)
+                output = self._graph_expand(
+                    output[:limit], max_expand=3, limit=limit * 2,
+                    query=query, label_filter=label_filter,
+                    date_from=date_from, date_to=date_to,
+                )
             if use_rerank and self.reranker and self.reranker.enabled:
                 output = self.reranker.rerank(query, output)
-            # _graph_expand already returns a truncated list; no further truncation needed
+            # _graph_expand truncates to limit*2 so graph hits can surface below base
             return output
 
         # ── 路径 B: 多查询扩展 + RRF ──
@@ -991,11 +919,15 @@ class Searcher:
                 output.append(doc)
 
         if graph_expand > 0 and self.embeddings.graph:
-            output = self._graph_expand(output[:limit], max_expand=3, limit=limit * 2, query=query)
+            output = self._graph_expand(
+                output[:limit], max_expand=3, limit=limit * 2,
+                query=query, label_filter=label_filter,
+                date_from=date_from, date_to=date_to,
+            )
         if use_rerank and self.reranker and self.reranker.enabled:
             output = self.reranker.rerank(query, output)
 
-        # _graph_expand already returns a truncated list; no further truncation needed
+        # _graph_expand truncates to limit*2 so graph hits can surface below base
         return output
 
     # ── 图查询 ──────────────────────────────────────────────
