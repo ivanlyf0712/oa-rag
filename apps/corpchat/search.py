@@ -116,6 +116,8 @@ DEFAULT_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "0"))
 DEFAULT_HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.5"))
 RRF_K_VALUE = 50
 MAX_SEARCH_LIMIT = 100
+# 重排序模型: 中文能力 (BAAI/bge-reranker-base — 中文/多语言交叉编码器)
+DEFAULT_RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
 DEFAULT_RERANK_TOP_N = 20
 
 # 查询权重 (§2.7 的 constants.py)
@@ -534,7 +536,7 @@ class QueryExpander:
 class Reranker:
     """交叉编码器重排序, 仅对前 rerank_top_n 个结果重排。"""
 
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    def __init__(self, model_name: str = DEFAULT_RERANKER_MODEL,
                  top_n: int = DEFAULT_RERANK_TOP_N):
         self.enabled = False
         self.model = None
@@ -896,7 +898,7 @@ class Searcher:
         label_filter: Optional[str] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
-        use_rerank: bool = False,
+        use_rerank: bool = True,
     ) -> List[Dict]:
         """
         执行搜索 (默认启用全链路 Onyx 风格搜索)。
@@ -1042,7 +1044,7 @@ class AgenticDecider:
     def decide(self, query: str) -> Dict[str, Any]:
         q_lower = query.lower()
         q_len = len(query.split())
-        decision = {"mode": "hybrid", "expand": True, "graph_expand": 0, "use_rerank": False}
+        decision = {"mode": "hybrid", "expand": True, "graph_expand": 0, "use_rerank": True}
         question_kws = {"谁", "什么", "何时", "where", "when", "who", "哪个", "如何"}
         similarity_kws = {"类似", "相关", "similar", "related", "like"}
         if any(kw in q_lower for kw in question_kws):
