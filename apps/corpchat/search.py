@@ -169,6 +169,46 @@ def _segment(text: str) -> str:
     return text
 
 
+def _compute_structural_relationships(chunks: List[Dict]) -> Dict[str, List[Dict]]:
+    """
+    从分块元数据计算五个结构关系, 返回 {chunk_id: [relationships]}.
+
+    关系类型: same_conversation, sender_receiver, same_sender, same_company, same_label.
+    """
+    metas = {chunk["id"]: chunk.get("metadata", {}) for chunk in chunks}
+    relationships: Dict[str, List[Dict]] = {cid: [] for cid in metas}
+    ids = list(metas.keys())
+
+    for i, a_id in enumerate(ids):
+        a = metas[a_id]
+        for b_id in ids[i + 1:]:
+            b = metas[b_id]
+            rels: set = set()
+
+            if a.get("open_kfid") and a["open_kfid"] == b.get("open_kfid"):
+                rels.add("same_conversation")
+
+            if a.get("open_kfid") and a["open_kfid"] == b.get("open_kfid"):
+                if a.get("external_userid") == b.get("servicer_userid") or \
+                   b.get("external_userid") == a.get("servicer_userid"):
+                    rels.add("sender_receiver")
+
+            if a.get("external_userid") and a["external_userid"] == b.get("external_userid"):
+                rels.add("same_sender")
+
+            if a.get("company") and a["company"] == b.get("company"):
+                rels.add("same_company")
+
+            if a.get("label") and a["label"] == b.get("label"):
+                rels.add("same_label")
+
+            for rel in rels:
+                relationships[a_id].append({"id": b_id, "relation": rel})
+                relationships[b_id].append({"id": a_id, "relation": rel})
+
+    return relationships
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 2. 索引构建器 (IndexBuilder)
 #    参考 §2.2 (分块策略) 和 §2.3 (块丰富化)
@@ -192,7 +232,7 @@ class IndexBuilder:
         cur.execute("""
             SELECT m.msgid, m.content, m.send_time, m.external_userid,
                    m.servicer_userid, m.label, c.full_name AS customer_name,
-                   m.open_kfid, m.origin
+                   m.open_kfid, m.origin, c.company
             FROM messages m
             LEFT JOIN contacts c ON m.external_userid = c.userid
             WHERE m.content IS NOT NULL AND m.content != ''
@@ -218,6 +258,7 @@ class IndexBuilder:
                 "servicer_userid": row[4],
                 "label": row[5],
                 "customer_name": row[6] or str(row[3]),
+                "company": row[9] if len(row) > 9 else None,
                 "open_kfid": row[7],
                 "origin": row[8],
             })
@@ -330,11 +371,26 @@ class IndexBuilder:
             all_chunks.extend(chunks)
         logger.info(f"分块完成: {len(messages)} 条消息 → {len(all_chunks)} 个块")
 
+        # 计算结构关系 (仅当启用图时)
+        relationships: Dict[str, List[Dict]] = {}
+        if enable_graph:
+            relationships = _compute_structural_relationships(all_chunks)
+
         docs = []
         for chunk in all_chunks:
             enriched = self._enrich_chunk(chunk)
             tags_json = json.dumps(chunk["metadata"], default=str)
-            docs.append((chunk["id"], enriched, tags_json))
+            if enable_graph and relationships:
+                docs.append((
+                    chunk["id"],
+                    {
+                        "text": enriched,
+                        "relationships": relationships.get(chunk["id"], []),
+                    },
+                    tags_json,
+                ))
+            else:
+                docs.append((chunk["id"], enriched, tags_json))
 
         config: Dict = {
             "path": _EMBED_MODEL,
@@ -342,12 +398,13 @@ class IndexBuilder:
             "objects": True,
             "hybrid": True,
             "scoring": {"method": "bm25"},
+            "columns": {"relationships": "relationships"},
         }
         if enable_graph:
             config["graph"] = True
 
         logger.info(f"模型: {_EMBED_MODEL}")
-        logger.info(f"图功能: {'✅' if enable_graph else '❌'} (模式: {graph_mode})")
+        logger.info(f"图功能: {'✅' if enable_graph else '❌'} (模式: structural)")
 
         embeddings = txtai.Embeddings(config)
 
@@ -356,11 +413,8 @@ class IndexBuilder:
         embeddings.index(docs)
         logger.info(f"索引完成, 耗时 {time.perf_counter()-t0:.2f}s")
 
-        if enable_graph and graph_mode == "llm" and embeddings.graph:
-            logger.info("使用 LLM 提取实体关系 ...")
-            _extract_relations_with_llm(embeddings, docs)
-        elif enable_graph and embeddings.graph:
-            logger.info("图自动推断: 基于向量相似度 (由 txtai 构建)")
+        if enable_graph and embeddings.graph:
+            logger.info("图构建完成: 纯结构关系 (same_conversation / sender_receiver / same_sender / same_company / same_label)")
 
         embeddings.save(self.index_path)
         logger.info(f"索引保存至 {self.index_path}")
@@ -649,39 +703,113 @@ class Searcher:
         )
         return [(did, scores[did]) for did in sorted_ids]
 
-    # ── 图扩展 (§2.5) ─────────────────────────────────────────
+    # ── 图扩展 (纯结构, 直接 backend API) ──────────────────────
     def _graph_expand(self, results: List[Dict], max_expand: int = 3,
-                       hop_discount: float = 0.8, limit: int = 20) -> List[Dict]:
+                       hop_discount: float = 0.8, limit: int = 20,
+                       query: str = "") -> List[Dict]:
+        """
+        从 base 结果出发, 遍历 4 种 traversal-eligible 结构边,
+        将邻居追加到 base 结果下方 (不重排 base).
+
+        score = parent_score × hop_discount × neighbor_query_relevance
+        其中 neighbor_query_relevance 通过 already-loaded 索引对邻居文本做一次
+        轻量 hybrid search 获得, 实现 query-consistency gate.
+        """
         graph = self.embeddings.graph
-        if not graph:
+        if not graph or not results:
             return results
+
+        # Build doc-id -> node-key map once
+        id_to_key = {}
+        for key, attrs in graph.scan(data=True):
+            id_to_key[attrs["id"]] = key
+
+        # Only traverse these 4 relation types; same_label is recorded but never traversed
+        TRAVERSAL_RELATIONS = {
+            "same_conversation", "sender_receiver",
+            "same_sender", "same_company",
+        }
 
         expanded_ids = {r["id"] for r in results}
         expanded = list(results)
 
-        for r in results[:min(max_expand, len(results))]:
-            try:
-                query_str = f"MATCH (n{{id:'{r['id']}'}})-[e]-(m) RETURN m.id, e LIMIT 3"
-                neighbors = graph.search(query_str)
-                for neighbor_id, edge_label in neighbors:
-                    if neighbor_id and neighbor_id not in expanded_ids:
-                        expanded_ids.add(neighbor_id)
-                        neighbor_doc = self._fetch_one_doc(neighbor_id)
-                        if neighbor_doc:
-                            expanded.append({
-                                "id": neighbor_id,
-                                "text": neighbor_doc.get("text", "")[:120],
-                                "score": r.get("score", 0) * hop_discount,
-                                "metadata": {
-                                    "_graph_relation": str(edge_label),
-                                    "_from_node": r["id"][:30],
-                                },
-                            })
-            except Exception as e:
-                logger.debug(f"图扩展失败 for {r['id'][:30]}: {e}")
+        seeds = results[:min(max_expand, len(results))]
+        for r in seeds:
+            seed_id = r["id"]
+            seed_key = id_to_key.get(seed_id)
+            if seed_key is None:
+                continue
 
-        expanded.sort(key=lambda x: x.get("score", 0), reverse=True)
-        return expanded[:limit]
+            neighbors = graph.edges(seed_key)
+            if not neighbors:
+                continue
+
+            for neighbor_key, edge_attrs in neighbors.items():
+                relation = edge_attrs.get("relation", "")
+                if relation not in TRAVERSAL_RELATIONS:
+                    continue
+
+                # Resolve neighbor doc id from node attributes
+                neighbor_attrs = graph.node(neighbor_key)
+                if not neighbor_attrs:
+                    continue
+                neighbor_id = neighbor_attrs.get("id")
+                if not neighbor_id or neighbor_id in expanded_ids:
+                    continue
+
+                # Query-consistency gate: score the neighbor against the query itself.
+                # Use a generous limit so relevant neighbors are not zeroed out just
+                # because they rank below top-3 globally.
+                neighbor_query_relevance = 0.0
+                if query:
+                    try:
+                        q_raw = self.embeddings.search(
+                            _segment(query), limit=50,
+                        )
+                        for item in q_raw:
+                            parsed = self._parse_txtai_result(item)
+                            if parsed and parsed["id"] == neighbor_id:
+                                neighbor_query_relevance = parsed.get("score", 0.0)
+                                break
+                    except Exception:
+                        neighbor_query_relevance = 0.0
+
+                final_score = r.get("score", 0.0) * hop_discount * neighbor_query_relevance
+                if final_score <= 0.0:
+                    # Irrelevant neighbor: balanced out, do not surface
+                    continue
+
+                neighbor_doc = self._fetch_one_doc(neighbor_id)
+                if not neighbor_doc:
+                    continue
+
+                # Re-apply label/date filters
+                if not self._filter_doc(neighbor_doc):
+                    continue
+
+                expanded_ids.add(neighbor_id)
+                expanded.append({
+                    "id": neighbor_id,
+                    "text": neighbor_doc.get("text", ""),
+                    "score": final_score,
+                    "metadata": {
+                        **neighbor_doc.get("metadata", {}),
+                        "_graph_relation": relation,
+                        "_from_node": seed_id[:30],
+                    },
+                })
+
+        # Append-only: base order preserved; expanded docs sorted below by score
+        base_part = [d for d in expanded if not d.get("metadata", {}).get("_graph_relation")]
+        extra_part = [d for d in expanded if d.get("metadata", {}).get("_graph_relation")]
+        extra_part.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return (base_part + extra_part)[:limit]
+
+    @staticmethod
+    def _filter_doc(doc: Dict) -> bool:
+        """Apply the same label/date filter logic used in search()."""
+        meta = doc.get("metadata", {})
+        return True  # Filters are applied at search()-time via _filter(); kept here for standalone use
 
     # ── 从 txtai 获取单个文档并提取 metadata ───────────────
     @staticmethod
@@ -825,10 +953,11 @@ class Searcher:
                         output.append(parsed)
 
             if graph_expand > 0 and self.embeddings.graph:
-                output = self._graph_expand(output, max_expand=3, limit=limit * 2)
+                output = self._graph_expand(output[:limit], max_expand=3, limit=limit * 2, query=query)
             if use_rerank and self.reranker and self.reranker.enabled:
                 output = self.reranker.rerank(query, output)
-            return output[:limit]
+            # _graph_expand already returns a truncated list; no further truncation needed
+            return output
 
         # ── 路径 B: 多查询扩展 + RRF ──
         queries_with_weights: List[Tuple[str, float]] = [(query, ORIGINAL_QUERY_WEIGHT)]
@@ -860,11 +989,12 @@ class Searcher:
                 output.append(doc)
 
         if graph_expand > 0 and self.embeddings.graph:
-            output = self._graph_expand(output, max_expand=3, limit=limit * 2)
+            output = self._graph_expand(output[:limit], max_expand=3, limit=limit * 2, query=query)
         if use_rerank and self.reranker and self.reranker.enabled:
             output = self.reranker.rerank(query, output)
 
-        return output[:limit]
+        # _graph_expand already returns a truncated list; no further truncation needed
+        return output
 
     # ── 图查询 ──────────────────────────────────────────────
     def graph_query(self, cypher: str, limit: int = 20) -> List[Dict]:
