@@ -1,0 +1,25 @@
+{
+  "path": "/home/ivanleeyf/ocr/models/all-MiniLM-L6-v2",
+  "content": true,
+  "objects": true,
+  "hybrid": true,
+  "scoring": {
+    "method": "bm25"
+  },
+  "graph": {
+    "backend": "networkx"
+  },
+  "dimensions": 384,
+  "backend": "faiss",
+  "offset": 140,
+  "build": {
+    "create": "2026-08-03T04:00:55Z",
+    "python": "3.14.4",
+    "settings": {
+      "components": "IDMap,Flat"
+    },
+    "system": "Linux (x86_64)",
+    "txtai": "9.12.0"
+  },
+  "update": "2026-08-03T04:00:55Z"
+}
