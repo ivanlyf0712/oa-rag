@@ -7,6 +7,7 @@ View contacts, messages, statistics, a chat-style conversation viewer, and seman
 import sys
 import os
 import json
+import hashlib
 import requests
 import streamlit as st
 import pandas as pd
