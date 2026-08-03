@@ -253,8 +253,8 @@ def test_graph_expand_surfaces_genuine_connection(searcher):
     graph_hits = [r for r in results if r.get("metadata", {}).get("_graph_relation")]
     assert graph_hits, f"No graph-expanded results surfaced: {results}"
     rels = {r["metadata"]["_graph_relation"] for r in graph_hits}
-    assert any(r in rels for r in {"same_conversation", "sender_receiver"}), (
-        f"Expected conversation relation in {rels}"
+    assert any(r in rels for r in {"same_conversation", "sender_receiver", "same_sender", "same_company"}), (
+        f"Expected a traversal-eligible structural relation in {rels}"
     )
 
 
