@@ -27,10 +27,11 @@ from apps.corpchat.search import (
     DEFAULT_INDEX_PATH,
 )
 
-# ── LiteLLM 配置（请在此填入你的 API 信息）──
-LITELLM_API_KEY = "sk-0qpH013nbqLvA0zJ5vhjZg"   # 替换为你的 LiteLLM API Key
-LITELLM_BASE_URL = "https://litellm.dchbi.app"  # 替换为你的 LiteLLM endpoint
-LITELLM_MODEL = "dseek-v4-flash"   # 或你想要的模型
+# ── LiteLLM 配置（密钥必须从环境变量提供, 不硬编码）──
+import os as _os
+LITELLM_API_KEY = _os.getenv("LITELLM_API_KEY", "")   # 从环境变量读取
+LITELLM_BASE_URL = _os.getenv("LITELLM_BASE_URL", "https://litellm.dchbi.app")
+LITELLM_MODEL = _os.getenv("LITELLM_MODEL", "dseek-v4-flash")
 
 # ── Page config ──
 st.set_page_config(

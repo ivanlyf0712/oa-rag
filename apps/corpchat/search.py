@@ -46,6 +46,14 @@ import click
 import txtai
 from tabulate import tabulate
 
+# ── 中文分词 (jieba) ─────────────────────────────────────────────
+try:
+    import jieba
+    jieba.setLogLevel(20)  # silence jieba's build-dict logging
+    _JIEBA_AVAILABLE = True
+except ImportError:
+    _JIEBA_AVAILABLE = False
+
 # ── 环境变量 (.env) ─────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
@@ -91,9 +99,9 @@ except ImportError:
 #    参考 analysis_report.md §2.2 (分块), §2.8 (RRF), §2.7 (权重)
 # ═══════════════════════════════════════════════════════════════════
 
-# 嵌入模型: 本地缓存优先
-_EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-_LOCAL_MODEL_PATH = os.path.join(ROOT_DIR, "models", "all-MiniLM-L6-v2")
+# 嵌入模型: 本地缓存优先 (默认 bge-m3 — 中文检索能力)
+_EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+_LOCAL_MODEL_PATH = os.path.join(ROOT_DIR, "models", "bge-m3")
 if os.path.isdir(_LOCAL_MODEL_PATH):
     _EMBED_MODEL = _LOCAL_MODEL_PATH
 
@@ -115,43 +123,20 @@ ORIGINAL_QUERY_WEIGHT = 0.5
 LLM_SEMANTIC_QUERY_WEIGHT = 1.3
 LLM_KEYWORD_QUERY_WEIGHT = 1.0
 
-# LiteLLM 配置
-LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "sk-0qpH013nbqLvA0zJ5vhjZg")
+# LiteLLM 配置 (密钥必须从环境变量提供, 不硬编码)
+LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "https://litellm.dchbi.app/")
 LITELLM_MODEL = os.getenv("LITELLM_MODEL", "dseek-v4-flash")
 
-# 富文本 Metadata 格式标记
+# 富文本 Metadata 格式标记 (已弃用 — 元数据现存于 sections.tags 列)
 _METADATA_MARKER = "\n---\nMetadata: "
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 辅助: 从 enriched text 中提取 metadata
-#     txtai 不使用独立的 tags 字段存储元数据;
-#     所有信息都在 enrich_text 的 "Metadata: key=value; ..." 部分。
+# 辅助: 从 enriched text 中提取干净内容
+#     metadata 现从 sections.tags 列按 id 查询 (见 _fetch_one_doc),
+#     不再从文本字符串中反向解析。
 # ═══════════════════════════════════════════════════════════════════
-
-def _extract_metadata_from_text(text: str) -> Dict[str, str]:
-    """
-    从 enriched text 格式中提取 metadata dict。
-    
-    索引时 _enrich_chunk 生成的格式:
-      [title]\n---\n[content]\n---\nMetadata: key=value; key=value; ...
-    
-    当 txtai 以 dict 格式返回时, 只有 id/text/score 三个字段,
-    tags 字段不存在(因为 objects=True 时不保留独立 tags 列)。
-    所以必须从 text 字符串中反向解析 metadata。
-    """
-    meta: Dict[str, str] = {}
-    if _METADATA_MARKER not in text:
-        return meta
-    meta_str = text.split(_METADATA_MARKER)[-1]
-    parts = [p.strip() for p in meta_str.split(";")]
-    for part in parts:
-        if "=" in part:
-            k, v = part.split("=", 1)
-            meta[k.strip()] = v.strip()
-    return meta
-
 
 def _clean_text_from_enriched(text: str) -> str:
     """
@@ -159,13 +144,28 @@ def _clean_text_from_enriched(text: str) -> str:
     
     返回: 去除了标题行和 Metadata 部分的原始消息内容。
     """
-    # 去掉 Metadata 后缀
+    # 去掉 Metadata 后缀 (兼容旧索引)
     if _METADATA_MARKER in text:
         text = text.split(_METADATA_MARKER)[0]
     # 去掉 title 前缀 (第一行 "---" 之前的内容和 "---" 分隔符)
     parts = text.split("\n---\n", 1)
     if len(parts) > 1:
         return parts[1]
+    return text
+
+
+def _segment(text: str) -> str:
+    """
+    使用 jieba 对中文文本进行分词, 以空格连接。
+
+    使 txtai 默认的 Unicode 分词器能按 jieba 的词语边界切分中文,
+    从而让 BM25 能匹配未加空格的中文短语 (如 投資美國債券跟藍籌股)。
+    索引与查询两侧使用同一分词器, 保证一致性。
+    """
+    if not text:
+        return text
+    if _JIEBA_AVAILABLE:
+        return " ".join(jieba.cut_for_search(text))
     return text
 
 
@@ -293,29 +293,20 @@ class IndexBuilder:
     # ── 丰富化 (§2.3) ──────────────────────────────────────────
     def _enrich_chunk(self, chunk: Dict) -> str:
         """
-        丰富化: 组合标题 + 内容 + 元数据 → 用于嵌入的最终文本。
+        丰富化: 组合标题 + 内容 → 用于嵌入与匹配的最终文本。
 
-        Onyx 对应: generate_enriched_content_for_chunk_embedding()
-        格式: [title]\n---\n[content]\n---\nMetadata: [key=value; ...]
-        
-        注意: txtai 不保留独立的 tags 列。所以所有 metadata 
-        必须编码在 text 字符串中, 通过 _extract_metadata_from_text() 反向解析。
+        匹配面 (match surface) 仅包含:
+          - 标题: customer_name (label)  — 提供消歧上下文
+          - 内容: 消息正文
+        元数据 (label, 时间, 发送者, 接收者, msgid 等) 不再拼入文本,
+        而是作为结构化 tags 存入 sections.tags 列, 用于过滤/展示/LLM 上下文。
+
+        格式: [title]\n---\n[content]
         """
         title = chunk.get("title", "")
         text = chunk["text"]
-        meta = chunk["metadata"]
-
-        meta_parts = []
-        for k, v in meta.items():
-            if k in ("msgid", "chunk_index", "origin"):
-                continue
-            val_str = str(v) if v is not None else "N/A"
-            if len(val_str) > 80:
-                val_str = val_str[:77] + "..."
-            meta_parts.append(f"{k}={val_str}")
-
-        meta_desc = "; ".join(meta_parts)
-        return f"{title}\n---\n{text}\n---\nMetadata: {meta_desc}"
+        # 中文分词: 让 BM25 能匹配未加空格的中文短语
+        return f"{title}\n---\n{_segment(text)}"
 
     # ── 索引构建入口 ──────────────────────────────────────────
     def build(self, force: bool = False, enable_graph: bool = True,
@@ -724,23 +715,47 @@ class Searcher:
         if not doc_id:
             return None
 
-        metadata = _extract_metadata_from_text(text)
         return {
             "id": doc_id,
             "text": text,
             "score": score,
-            "metadata": metadata,
+            "metadata": {},
         }
 
     def _fetch_one_doc(self, doc_id: str) -> Optional[Dict]:
-        """通过 doc_id 从索引中取出文档并解析。"""
+        """
+        通过 doc_id 从索引的 sections 表取出文档文本与结构化 tags。
+
+        修复: 旧实现用 embeddings.search(f"id:{doc_id}") 做文本搜索,
+        那是一次错误的 BM25 查询, 会返回错误文档。这里改为按 id 直接
+        查询 SQLite sections 表, 同时取回 tags 元数据。
+        """
         try:
-            raw = self.embeddings.search(f"id:{doc_id}", limit=1)
-            if raw:
-                return self._parse_txtai_result(raw[0])
-        except Exception:
-            pass
-        return None
+            db = self.embeddings.database
+            if db is None:
+                return None
+            conn = db.connection
+            cur = conn.cursor()
+            cur.execute("SELECT text, tags FROM sections WHERE id = ?", (doc_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            text, tags_json = row
+            metadata = {}
+            if tags_json:
+                try:
+                    metadata = json.loads(tags_json) if isinstance(tags_json, str) else dict(tags_json)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            return {
+                "id": doc_id,
+                "text": text,
+                "score": 0.0,
+                "metadata": metadata,
+            }
+        except Exception as e:
+            logger.debug(f"按 id 获取文档失败 {doc_id}: {e}")
+            return None
 
     # ── 搜索主入口 ──────────────────────────────────────────
     def search(
@@ -753,7 +768,7 @@ class Searcher:
         label_filter: Optional[str] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
-        use_rerank: bool = True,
+        use_rerank: bool = False,
     ) -> List[Dict]:
         """
         执行搜索 (默认启用全链路 Onyx 风格搜索)。
@@ -792,14 +807,22 @@ class Searcher:
                 return False
             return True
 
+        # 中文分词: 查询与索引使用同一 jieba 分词, 保证 BM25 匹配一致
+        segmented_query = _segment(query)
+
         # ── 路径 A: 直接 txtai 搜索 ──
         if not expand or not self.expander:
-            raw = self.embeddings.search(query, limit=min(limit * 3, MAX_SEARCH_LIMIT), weights=weights)
+            raw = self.embeddings.search(segmented_query, limit=min(limit * 3, MAX_SEARCH_LIMIT), weights=weights)
             output = []
             for item in raw:
                 parsed = self._parse_txtai_result(item)
-                if parsed and _filter(parsed):
-                    output.append(parsed)
+                if parsed:
+                    # 按 id 取回结构化 tags 元数据 (过滤/展示用)
+                    doc = self._fetch_one_doc(parsed["id"])
+                    if doc:
+                        parsed["metadata"] = doc["metadata"]
+                    if _filter(parsed):
+                        output.append(parsed)
 
             if graph_expand > 0 and self.embeddings.graph:
                 output = self._graph_expand(output, max_expand=3, limit=limit * 2)
@@ -817,7 +840,7 @@ class Searcher:
 
         all_results: List[Tuple[List[Tuple[str, float]], float]] = []
         for q, q_weight in queries_with_weights:
-            raw = self.embeddings.search(q, limit=min(limit * 3, MAX_SEARCH_LIMIT), weights=weights)
+            raw = self.embeddings.search(_segment(q), limit=min(limit * 3, MAX_SEARCH_LIMIT), weights=weights)
             result_list: List[Tuple[str, float]] = []
             for item in raw:
                 parsed = self._parse_txtai_result(item)
