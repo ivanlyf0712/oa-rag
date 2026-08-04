@@ -367,15 +367,7 @@ if page == "Search":
     if "searching" not in st.session_state:
         st.session_state.searching = False
 
-    # Handle interrupted search from reload (stop and discard)
-    if st.session_state.searching:
-        # Discard any processing turns
-        st.session_state.chat_history = [
-            t for t in st.session_state.chat_history if t.get("status") != "processing"
-        ]
-        st.session_state.searching = False
-
-    # Check if there's a pending processing turn (from a previous rerun)
+    # Check if there's a pending processing turn (from query submission)
     pending_turn = None
     for turn in st.session_state.chat_history:
         if turn.get("status") == "processing":
