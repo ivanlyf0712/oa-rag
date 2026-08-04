@@ -324,6 +324,18 @@ def test_app_rerank_improves_or_matches_base(monkeypatch, app_searcher, embeddin
 
 
 # ── Graceful DB failure (app must not crash when Postgres is down) ──
+def test_app_loads_litellm_env(monkeypatch):
+    """app.py must read LITELLM vars from .env so the UI can reach the server."""
+    # Ensure the module-level vars were populated from .env
+    assert app_module.LITELLM_API_KEY, "LITELLM_API_KEY not loaded from .env"
+    assert app_module.LITELLM_BASE_URL, "LITELLM_BASE_URL not loaded from .env"
+    assert app_module.LITELLM_MODEL, "LITELLM_MODEL not loaded from .env"
+    # BASE_URL must point at the running LiteLLM proxy
+    assert "litellm" in app_module.LITELLM_BASE_URL, (
+        f"Unexpected LITELLM_BASE_URL: {app_module.LITELLM_BASE_URL}"
+    )
+
+
 def test_app_db_down_does_not_crash(monkeypatch):
     """Helpers must return empty data instead of raising when the DB is down."""
     def _raise(*args, **kwargs):

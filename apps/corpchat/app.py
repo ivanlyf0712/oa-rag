@@ -21,6 +21,13 @@ if ROOT_DIR not in sys.path:
 from core.db import get_db_connection
 from core.config import OLLAMA_URL, RAG_MODEL
 
+# ── Load .env explicitly so the UI can reach LiteLLM & search config ──
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(ROOT_DIR, ".env"))
+except ImportError:
+    pass
+
 # ── Import Onyx-style search from search.py ──
 from apps.corpchat.search import (
     load_index,
