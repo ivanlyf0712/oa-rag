@@ -108,8 +108,10 @@ def _make_fake_streamlit():
     st.columns = lambda *a, **k: [_noop_context() for _ in range(len(a[0]) if a and isinstance(a[0], (list, tuple)) else (a[0] if a else 1))]
     st.button = lambda *a, **k: False
     st.checkbox = lambda *a, **k: True
+    st.radio = lambda *a, **k: (a[1][0] if len(a) > 1 and a[1] else None)
     st.selectbox = lambda *a, **k: (a[1][0] if len(a) > 1 and a[1] else None)
     st.text_input = lambda *a, **k: ""
+    st.chat_input = lambda *a, **k: None
     st.number_input = lambda *a, **k: 1
     st.slider = lambda *a, **k: 10
     st.dataframe = _noop
@@ -121,6 +123,31 @@ def _make_fake_streamlit():
     )
     st.cache_data = lambda *a, **k: (a[0] if a else (lambda f: f))
     st.cache_resource = lambda *a, **k: (a[0] if a else (lambda f: f))
+
+    # ── Fake sidebar supporting nested context managers (st.sidebar, st.sidebar.expander) ──
+    class _FakeSidebar:
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def title(self, *a, **k):
+            return None
+        def caption(self, *a, **k):
+            return None
+        def divider(self, *a, **k):
+            return None
+        def radio(self, *a, **k):
+            return (a[1][0] if len(a) > 1 and a[1] else None)
+        def checkbox(self, *a, **k):
+            return True
+        def slider(self, *a, **k):
+            return 10
+        def text_input(self, *a, **k):
+            return ""
+        def expander(self, *a, **k):
+            return _noop_context()
+
+    st.sidebar = _FakeSidebar()
     return st
 
 
