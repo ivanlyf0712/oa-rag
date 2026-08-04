@@ -35,9 +35,9 @@ from apps.corpchat.search import (
     DEFAULT_INDEX_PATH,
 )
 
-# ── LiteLLM 配置（密钥必须从环境变量提供, 不硬编码）──
+# ── LiteLLM config ──
 import os as _os
-LITELLM_API_KEY = _os.getenv("LITELLM_API_KEY", "")   # 从环境变量读取
+LITELLM_API_KEY = _os.getenv("LITELLM_API_KEY", "")
 LITELLM_BASE_URL = _os.getenv("LITELLM_BASE_URL", "https://litellm.dchbi.app")
 LITELLM_MODEL = _os.getenv("LITELLM_MODEL", "dseek-v4-flash")
 
@@ -45,29 +45,38 @@ LITELLM_MODEL = _os.getenv("LITELLM_MODEL", "dseek-v4-flash")
 st.set_page_config(
     page_title="CorpChat Intelligence",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
+
+# ═══════════════════════════════════════ professional CSS ════════════════════════════════════
+st.markdown("""
+<style>
+.stApp { background: #0e1117; color: #e6e6e6; font-family: 'Inter','Segoe UI',system-ui,sans-serif; }
+.stApp .stMarkdown p, .stApp .stMarkdown li { color: #c9d1d9; }
+section[data-testid="stSidebar"] { background: #161b22; border-right: 1px solid #30363d; }
+section[data-testid="stSidebar"] .stRadio > label { color: #58a6ff; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+h1, h2, h3 { color: #f0f6fc !important; font-weight: 700 !important; letter-spacing: -0.02em; }
+h1 { border-bottom: 2px solid #30363d; padding-bottom: 0.3em; }
+.stChatMessage [data-testid="stChatMessageContent"] { border-radius: 8px; padding: 12px 16px; }
+.stDataFrame { border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
+.streamlit-expander { border: 1px solid #30363d; border-radius: 6px; background: #161b22; }
+[data-testid="stMetric"] { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+.stChatInput { border-top: 1px solid #30363d; }
+</style>
+""", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════ sidebar navigation ════════════════════════════════════
 with st.sidebar:
-    st.title("🕵️ CorpChat")
+    st.markdown("## CorpChat Intelligence")
+    st.caption("Corporate Relationship & Chat Analytics")
+    st.divider()
     page = st.radio(
         "Navigate",
         ["Search", "Contacts", "Messages", "Overview", "Chat Viewer", "Onyx Chat"],
         index=0,
     )
-    # Onyx Chat is planned for retirement — kept for backward compatibility
     if page == "Onyx Chat":
-        st.caption("⚠️ Onyx Chat is deprecated and will be removed in a future release.")
-
-    st.divider()
-    with st.expander("Enhancements", expanded=False):
-        use_rerank = st.checkbox("Use reranker", value=True, help="Rerank results with a cross-encoder")
-        expand = st.checkbox("LLM query expansion", value=True, help="Expand query via LiteLLM")
-        graph_expand = st.slider("Graph hops", min_value=0, max_value=3, value=1, help="Number of graph expansion hops")
-        agentic = st.checkbox("Agentic mode", value=False, help="Let the agent decide mode/expansion/rerank")
-        label_filter = st.text_input("Label filter", value="", help="Filter results by label (e.g. quotation_request)")
-        top_k = st.slider("Top-k results", min_value=1, max_value=20, value=5)
+        st.caption("Deprecated — will be removed in a future release.")
 
 # ═══════════════════════════════════════ DB helpers ════════════════════════════════════
 @st.cache_data(ttl=30)
@@ -81,7 +90,7 @@ def fetch_contacts():
         conn.close()
         return df
     except Exception:
-        st.warning("Contacts unavailable — is the database running? Start PostgreSQL, then run the data generator.")
+        st.warning("Contacts unavailable — is the database running?")
         return pd.DataFrame()
 
 @st.cache_data(ttl=30)
@@ -89,15 +98,15 @@ def fetch_messages():
     try:
         conn = get_db_connection()
         df = pd.read_sql(
-            """SELECT id, msgid, open_kfid, external_userid, send_time, origin, 
-                      servicer_userid, msgtype, content, label, created_at 
+            """SELECT id, msgid, open_kfid, external_userid, send_time, origin,
+                      servicer_userid, msgtype, content, label, created_at
                FROM messages ORDER BY send_time DESC LIMIT 500""",
             conn
         )
         conn.close()
         return df
     except Exception:
-        st.warning("Messages unavailable — is the database running? Start PostgreSQL, then run the data generator.")
+        st.warning("Messages unavailable — is the database running?")
         return pd.DataFrame()
 
 @st.cache_data(ttl=60)
@@ -116,7 +125,7 @@ def fetch_stats():
         conn.close()
         return contacts, messages, conversations, labels
     except Exception:
-        st.warning("Stats unavailable — is the database running? Start PostgreSQL, then run the data generator.")
+        st.warning("Stats unavailable — is the database running?")
         return 0, 0, 0, []
 
 @st.cache_data(ttl=30)
@@ -124,13 +133,32 @@ def fetch_conversation(open_kfid):
     try:
         conn = get_db_connection()
         df = pd.read_sql(
-            """SELECT id, msgid, external_userid, send_time, origin, 
-                      servicer_userid, msgtype, content, label, created_at 
-               FROM messages 
-               WHERE open_kfid = %s 
+            """SELECT id, msgid, external_userid, send_time, origin,
+                      servicer_userid, msgtype, content, label, created_at
+               FROM messages
+               WHERE open_kfid = %s
                ORDER BY send_time ASC""",
             conn,
             params=(open_kfid,)
+        )
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=30)
+def fetch_conversations_for_contact(userid):
+    """Fetch all messages involving a contact (as sender or receiver)."""
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql(
+            """SELECT id, msgid, open_kfid, external_userid, send_time, origin,
+                      servicer_userid, msgtype, content, label, created_at
+               FROM messages
+               WHERE external_userid = %s OR servicer_userid = %s
+               ORDER BY send_time ASC""",
+            conn,
+            params=(userid, userid)
         )
         conn.close()
         return df
@@ -182,7 +210,6 @@ def search_messages_onyx(
     """
     from apps.corpchat.search import QueryExpander, Reranker, AgenticDecider
 
-    # Agentic override: let the decider decide params before searching
     if agentic:
         decider = AgenticDecider()
         decision = decider.decide(query)
@@ -193,7 +220,6 @@ def search_messages_onyx(
     else:
         mode = "hybrid"
 
-    # Construct expander/reranker so wiring tests can spy on them
     expander = QueryExpander() if expand else None
     reranker = Reranker() if use_rerank else None
 
@@ -227,7 +253,6 @@ def search_messages_onyx(
 
 # ═══════════════════════════════════ LiteLLM helper ════════════════════════════════════
 def generate_answer_litellm(query: str, context: str) -> str:
-    """Generate a natural-language answer from retrieved context via LiteLLM."""
     if not LITELLM_API_KEY:
         return "LiteLLM API key not configured. Set LITELLM_API_KEY in .env."
     url = LITELLM_BASE_URL.rstrip("/") + "/v1/chat/completions"
@@ -237,8 +262,7 @@ def generate_answer_litellm(query: str, context: str) -> str:
         "messages": [
             {
                 "role": "system",
-                "content": "You are a helpful assistant answering questions based on retrieved chat messages. "
-                           "Answer concisely in the same language as the query. If the context doesn't contain the answer, say so."
+                "content": "You are a helpful assistant answering questions based on retrieved chat messages. Answer concisely in the same language as the query. If the context doesn't contain the answer, say so."
             },
             {
                 "role": "user",
@@ -263,7 +287,6 @@ def _load_search_index():
 
 @st.cache_data(ttl=30)
 def _run_search(query: str, top_k: int, use_rerank: bool, expand: bool, graph_expand: int, agentic: bool, label_filter: str):
-    """Run search and return (tuple_results, raw_dict_hits) for Details."""
     if not query.strip():
         return [], []
     try:
@@ -279,7 +302,6 @@ def _run_search(query: str, top_k: int, use_rerank: bool, expand: bool, graph_ex
             graph_expand=graph_expand,
             label_filter=label_filter or None,
         )
-        # Convert List[Dict] → tuples for backward-compat with tests
         tuple_results = []
         for doc in raw_results:
             meta = doc.get("metadata", {})
@@ -297,10 +319,9 @@ def _run_search(query: str, top_k: int, use_rerank: bool, expand: bool, graph_ex
         return [], []
 
 def _render_chat_history(history: list):
-    """Render WhatsApp-style chat bubbles."""
     for turn in history:
         with st.chat_message("user"):
-            st.markdown(f"**You:** {turn['query']}")
+            st.markdown(turn["query"])
         with st.chat_message("assistant"):
             st.markdown(turn["answer"])
             with st.expander("Details", expanded=False):
@@ -309,10 +330,9 @@ def _render_chat_history(history: list):
                         pd.DataFrame(turn["raw_hits"]),
                         column_config={
                             "id": st.column_config.TextColumn("Message ID"),
-                            "customer": st.column_config.TextColumn("Customer"),
-                            "label": st.column_config.TextColumn("Label"),
-                            "similarity": st.column_config.NumberColumn("Similarity"),
-                            "content": st.column_config.TextColumn("Content"),
+                            "text": st.column_config.TextColumn("Content"),
+                            "score": st.column_config.NumberColumn("Score"),
+                            "metadata": st.column_config.TextColumn("Metadata"),
                         },
                         hide_index=True,
                         use_container_width=True,
@@ -322,59 +342,67 @@ def _render_chat_history(history: list):
 
 # ═══════════════════════════════════════ pages ════════════════════════════════════
 if page == "Search":
-    st.title("🔍 Search")
+    st.title("Search")
 
-    # Chat history lives in session state
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    # Two-column layout: chat (wide) + controls (narrow right panel)
+    chat_col, ctrl_col = st.columns([3, 1])
 
-    # Render existing history
-    _render_chat_history(st.session_state.chat_history)
+    with ctrl_col:
+        st.markdown("### Enhancements")
+        use_rerank = st.checkbox("Reranker", value=True, help="Cross-encoder reranking")
+        expand = st.checkbox("LLM expansion", value=True, help="Expand query via LiteLLM")
+        graph_expand = st.slider("Graph hops", min_value=0, max_value=3, value=1)
+        agentic = st.checkbox("Agentic mode", value=False, help="Agent decides params")
+        st.divider()
+        st.markdown("### Filters")
+        label_filter = st.text_input("Label filter", value="", help="e.g. quotation_request")
+        top_k = st.slider("Top-k", min_value=1, max_value=20, value=5)
 
-    # Chat input at the bottom
-    query = st.chat_input("Ask anything about the conversations...")
-    if query:
-        with st.spinner("Thinking..."):
-            results, raw_hits = _run_search(
-                query, top_k, use_rerank, expand, graph_expand, agentic, label_filter
-            )
-            # Build context from raw hits for LLM answer
-            context_parts = []
-            for hit in raw_hits[: top_k * 2]:
-                content = hit.get("text", "") if isinstance(hit, dict) else ""
-                if content:
-                    context_parts.append(content)
-            context = "\n---\n".join(context_parts) if context_parts else "No relevant context found."
+    with chat_col:
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
 
-            if agentic:
-                # Agentic mode: let the agent decide parameters
-                try:
-                    from apps.corpchat.search import AgenticDecider
-                    decider = AgenticDecider()
-                    decision = decider.decide(query)
-                    mode = decision.get("mode", "hybrid")
-                    expand = decision.get("expand", expand)
-                    graph_expand = decision.get("graph_expand", graph_expand)
-                    use_rerank = decision.get("use_rerank", use_rerank)
-                    # Re-run with decided params
-                    results, raw_hits = _run_search(
-                        query, top_k, use_rerank, expand, graph_expand, False, label_filter
-                    )
-                    context_parts = [hit.get("text", "") if isinstance(hit, dict) else "" for hit in raw_hits[: top_k * 2] if isinstance(hit, dict) and hit.get("text")]
-                    context = "\n---\n".join(context_parts) if context_parts else "No relevant context found."
-                except Exception as e:
-                    st.warning(f"Agentic decision failed: {e}")
+        _render_chat_history(st.session_state.chat_history)
 
-            answer = generate_answer_litellm(query, context)
-            st.session_state.chat_history.append({
-                "query": query,
-                "answer": answer,
-                "raw_hits": raw_hits,
-            })
-        st.rerun()
+        query = st.chat_input("Ask anything about the conversations...")
+        if query:
+            with st.spinner("Processing..."):
+                results, raw_hits = _run_search(
+                    query, top_k, use_rerank, expand, graph_expand, agentic, label_filter
+                )
+                context_parts = []
+                for hit in raw_hits[: top_k * 2]:
+                    content = hit.get("text", "") if isinstance(hit, dict) else ""
+                    if content:
+                        context_parts.append(content)
+                context = "\n---\n".join(context_parts) if context_parts else "No relevant context found."
+
+                if agentic:
+                    try:
+                        from apps.corpchat.search import AgenticDecider
+                        decider = AgenticDecider()
+                        decision = decider.decide(query)
+                        expand = decision.get("expand", expand)
+                        graph_expand = decision.get("graph_expand", graph_expand)
+                        use_rerank = decision.get("use_rerank", use_rerank)
+                        results, raw_hits = _run_search(
+                            query, top_k, use_rerank, expand, graph_expand, False, label_filter
+                        )
+                        context_parts = [hit.get("text", "") if isinstance(hit, dict) else "" for hit in raw_hits[: top_k * 2] if isinstance(hit, dict) and hit.get("text")]
+                        context = "\n---\n".join(context_parts) if context_parts else "No relevant context found."
+                    except Exception as e:
+                        st.warning(f"Agentic decision failed: {e}")
+
+                answer = generate_answer_litellm(query, context)
+                st.session_state.chat_history.append({
+                    "query": query,
+                    "answer": answer,
+                    "raw_hits": raw_hits,
+                })
+            st.rerun()
 
 elif page == "Contacts":
-    st.title("👥 Contacts")
+    st.title("Contacts")
     df = fetch_contacts()
     if df.empty:
         st.warning("No contacts available.")
@@ -382,7 +410,7 @@ elif page == "Contacts":
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 elif page == "Messages":
-    st.title("💬 Messages")
+    st.title("Messages")
     df = fetch_messages()
     if df.empty:
         st.warning("No messages available.")
@@ -390,7 +418,7 @@ elif page == "Messages":
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 elif page == "Overview":
-    st.title("📊 Overview")
+    st.title("Overview")
     contacts, messages, conversations, labels = fetch_stats()
     col1, col2, col3 = st.columns(3)
     col1.metric("Total Contacts", contacts)
@@ -402,26 +430,28 @@ elif page == "Overview":
         st.bar_chart(label_df.set_index("Label"))
 
 elif page == "Chat Viewer":
-    st.title("🗨️ Chat Viewer")
-    contacts = fetch_contacts()
-    if contacts.empty:
+    st.title("Chat Viewer")
+    name_map = fetch_contact_name_map()
+    if not name_map:
         st.warning("No contacts available.")
     else:
-        contact_options = {f"{row['full_name']} ({row['company']})": row['userid'] for _, row in contacts.iterrows()}
+        contact_options = {name: uid for uid, name in name_map.items()}
         selected = st.selectbox("Select a contact", list(contact_options.keys()))
         if selected:
             userid = contact_options[selected]
-            conv_df = fetch_conversation(userid)
+            conv_df = fetch_conversations_for_contact(userid)
             if conv_df.empty:
                 st.info("No messages for this contact.")
             else:
+                st.caption(f"{len(conv_df)} messages")
                 for _, row in conv_df.iterrows():
-                    with st.chat_message("user" if row["origin"] == "3" else "assistant"):
-                        st.markdown(row["content"])
+                    is_user = row["origin"] == "3"
+                    with st.chat_message("user" if is_user else "assistant"):
+                        st.markdown(f"**{row['external_userid']}** ({row.get('label', '')})\n\n{row['content']}")
 
 elif page == "Onyx Chat":
     # TODO: retire this tab — kept for backward compatibility
-    st.title("🤖 Onyx Chat (deprecated)")
+    st.title("Onyx Chat (deprecated)")
     st.caption("This tab will be removed in a future release. Use Search for the chat experience.")
     try:
         iframe_url = OLLAMA_URL or "http://localhost:11434"
