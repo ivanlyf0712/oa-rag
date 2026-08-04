@@ -323,6 +323,92 @@ def test_app_rerank_improves_or_matches_base(monkeypatch, app_searcher, embeddin
     )
 
 
+# ── Agentic wiring through app.py ───────────────────────────────
+def test_app_agentic_wired(monkeypatch, app_searcher, embeddings):
+    """app.py must construct an AgenticDecider when agentic=True."""
+    import apps.corpchat.search as search_module
+    from apps.corpchat.search import AgenticDecider
+
+    captured = {}
+
+    def _fake_decider(*args, **kwargs):
+        captured["constructed"] = True
+        return AgenticDecider(*args, **kwargs)
+
+    monkeypatch.setattr(search_module, "AgenticDecider", _fake_decider)
+
+    app_searcher.search_messages_onyx(
+        "物流報價 方案", top_k=5, use_rerank=False, expand=False, graph_expand=0,
+        agentic=True
+    )
+    assert captured.get("constructed"), "AgenticDecider was not constructed when agentic=True"
+
+
+def test_app_agentic_decision_overrides_manual_params(monkeypatch, app_searcher, embeddings):
+    """agentic=True must let AgenticDecider override mode/expand/graph/rerank."""
+    import apps.corpchat.search as search_module
+    from apps.corpchat.search import Searcher
+
+    captured = {}
+
+    class _FakeDecider:
+        def decide(self, query):
+            return {"mode": "keyword", "expand": False, "graph_expand": 0, "use_rerank": False}
+
+    monkeypatch.setattr(search_module, "AgenticDecider", _FakeDecider)
+
+    original_search = Searcher.search
+
+    def _spy_search(self, *args, **kwargs):
+        captured["mode"] = kwargs.get("mode")
+        captured["expand"] = kwargs.get("expand")
+        captured["graph_expand"] = kwargs.get("graph_expand")
+        captured["use_rerank"] = kwargs.get("use_rerank")
+        return original_search(self, *args, **kwargs)
+
+    monkeypatch.setattr(Searcher, "search", _spy_search)
+
+    # Pass manual params that should be overridden by the agentic decision
+    app_searcher.search_messages_onyx(
+        "物流報價 方案", top_k=5, use_rerank=True, expand=True, graph_expand=1,
+        agentic=True
+    )
+    assert captured.get("mode") == "keyword", f"mode not overridden: {captured.get('mode')}"
+    assert captured.get("expand") is False, f"expand not overridden: {captured.get('expand')}"
+    assert captured.get("graph_expand") == 0, f"graph_expand not overridden: {captured.get('graph_expand')}"
+    assert captured.get("use_rerank") is False, f"use_rerank not overridden: {captured.get('use_rerank')}"
+
+
+def test_app_agentic_defaults_to_false(monkeypatch, app_searcher, embeddings):
+    """agentic must default to False — manual params are used unless toggled."""
+    import apps.corpchat.search as search_module
+    from apps.corpchat.search import Searcher
+
+    captured = {}
+
+    class _FakeDecider:
+        def decide(self, query):
+            captured["called"] = True
+            return {"mode": "keyword", "expand": False, "graph_expand": 0, "use_rerank": False}
+
+    monkeypatch.setattr(search_module, "AgenticDecider", _FakeDecider)
+
+    original_search = Searcher.search
+
+    def _spy_search(self, *args, **kwargs):
+        captured["mode"] = kwargs.get("mode")
+        return original_search(self, *args, **kwargs)
+
+    monkeypatch.setattr(Searcher, "search", _spy_search)
+
+    # No agentic param → default False → manual hybrid mode, decider NOT called
+    app_searcher.search_messages_onyx(
+        "物流報價 方案", top_k=5, use_rerank=False, expand=False, graph_expand=0
+    )
+    assert "called" not in captured, "AgenticDecider should not be called when agentic=False"
+    assert captured.get("mode") == "hybrid", f"mode should be hybrid by default: {captured.get('mode')}"
+
+
 # ── Full pipeline: all four tickets together ────────────────────
 def test_app_full_pipeline_all_layers(monkeypatch, app_searcher, embeddings):
     """app.py default (expand=True, use_rerank=True, graph_expand=1) must work."""

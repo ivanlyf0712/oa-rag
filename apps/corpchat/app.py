@@ -188,6 +188,7 @@ def search_messages_onyx(
     use_rerank: bool = True,
     expand: bool = True,
     graph_expand: int = 1,
+    agentic: bool = False,
 ):
     """
     使用 search.py 的 Searcher (Onyx §2.5-§2.8) 执行 **全链路** 搜索。
@@ -196,6 +197,9 @@ def search_messages_onyx(
       - LLM 查询扩展 + 多查询加权 RRF 融合 (expand=True)
       - 图一跳邻居扩展 (graph_expand=1)
       - 交叉编码器重排序 (use_rerank=True)
+
+    当 agentic=True 时, 使用 AgenticDecider 根据查询内容自动决定
+    mode / expand / graph_expand / use_rerank, 覆盖手动传入的参数。
 
     Searcher 已修复:
       - metadata 从 enriched text 的 "Metadata: key=value;..." 后缀中反向解析
@@ -207,6 +211,17 @@ def search_messages_onyx(
     embeddings = _load_search_index()
     if embeddings is None:
         return []
+
+    # Agentic decision: let AgenticDecider pick mode/expand/graph/rerank per query
+    if agentic:
+        from apps.corpchat.search import AgenticDecider
+        decision = AgenticDecider().decide(query)
+        mode = decision.get("mode", "hybrid")
+        expand = decision.get("expand", expand)
+        graph_expand = decision.get("graph_expand", graph_expand)
+        use_rerank = decision.get("use_rerank", use_rerank)
+    else:
+        mode = "hybrid"
 
     query_expander = None
     if expand:
@@ -221,7 +236,7 @@ def search_messages_onyx(
     searcher = Searcher(embeddings, expander=query_expander, reranker=reranker)
     results = searcher.search(
         query=query,
-        mode="hybrid",
+        mode=mode,
         limit=top_k,
         expand=expand,
         graph_expand=graph_expand,
@@ -489,7 +504,7 @@ with tab5:
     with col_f4:
         use_rerank = st.checkbox("Rerank (cross-encoder)", value=True, key="search_rerank")
 
-    col_adv1, col_adv2, col_adv3 = st.columns([1, 1, 2])
+    col_adv1, col_adv2, col_adv3, col_adv4 = st.columns([1, 1, 1, 2])
     with col_adv1:
         use_expand = st.checkbox("LLM query expand", value=True, key="search_expand",
                                  help="启用 LLM 查询扩展 + 多查询加权 RRF 融合")
@@ -498,6 +513,9 @@ with tab5:
                                        key="search_graph_expand",
                                        help="图一跳邻居扩展数 (0=关闭)")
     with col_adv3:
+        use_agentic = st.checkbox("Agentic", value=False, key="search_agentic",
+                                  help="自动决定 mode/expand/graph/rerank (覆盖手动设置)")
+    with col_adv4:
         st.markdown("")  # spacer
 
     col_q1, col_q2 = st.columns([4, 1])
@@ -516,6 +534,8 @@ with tab5:
             to_date = datetime.strptime(date_to, "%Y-%m-%d").isoformat() if date_to else None
 
             features_desc = []
+            if use_agentic:
+                features_desc.append("Agentic")
             if use_expand:
                 features_desc.append("LLM 扩展+RRF")
             if graph_expand > 0:
@@ -530,6 +550,7 @@ with tab5:
                         use_rerank=use_rerank,
                         expand=use_expand,
                         graph_expand=graph_expand,
+                        agentic=use_agentic,
                     )
                     st.session_state.search_results = results
                     st.session_state.search_query = search_query
