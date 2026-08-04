@@ -55,8 +55,8 @@ def fetch_contacts():
         )
         conn.close()
         return df
-    except Exception as e:
-        st.warning(f"Contacts unavailable: {e}")
+    except Exception:
+        st.warning("Contacts unavailable — is the database running? Start PostgreSQL, then run the data generator.")
         return pd.DataFrame()
 
 @st.cache_data(ttl=30)
@@ -71,8 +71,8 @@ def fetch_messages():
         )
         conn.close()
         return df
-    except Exception as e:
-        st.warning(f"Messages unavailable: {e}")
+    except Exception:
+        st.warning("Messages unavailable — is the database running? Start PostgreSQL, then run the data generator.")
         return pd.DataFrame()
 
 @st.cache_data(ttl=60)
@@ -96,8 +96,8 @@ def fetch_stats():
         cur.close()
         conn.close()
         return total_contacts, total_msgs, total_convos, label_counts
-    except Exception as e:
-        st.warning(f"Statistics unavailable: {e}")
+    except Exception:
+        st.warning("Statistics unavailable — is the database running? Start PostgreSQL, then run the data generator.")
         return 0, 0, 0, []
 
 # ── Chat viewer helpers ──
