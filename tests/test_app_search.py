@@ -323,6 +323,34 @@ def test_app_rerank_improves_or_matches_base(monkeypatch, app_searcher, embeddin
     )
 
 
+# ── Graceful DB failure (app must not crash when Postgres is down) ──
+def test_app_db_down_does_not_crash(monkeypatch):
+    """Helpers must return empty data instead of raising when the DB is down."""
+    def _raise(*args, **kwargs):
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr(app_module, "get_db_connection", _raise)
+
+    # Each helper must degrade gracefully
+    df_contacts = app_module.fetch_contacts()
+    assert df_contacts.empty, "fetch_contacts should return empty DataFrame on DB failure"
+
+    df_msgs = app_module.fetch_messages()
+    assert df_msgs.empty, "fetch_messages should return empty DataFrame on DB failure"
+
+    stats = app_module.fetch_stats()
+    assert stats == (0, 0, 0, []), f"fetch_stats should return zeros on DB failure: {stats}"
+
+    name_map = app_module.get_contact_name_map()
+    assert name_map == {}, "get_contact_name_map should return {} on DB failure"
+
+    convs = app_module.get_conversation_list()
+    assert convs == [], "get_conversation_list should return [] on DB failure"
+
+    msgs = app_module.get_messages_for_conversation("kf_test_0")
+    assert msgs.empty, "get_messages_for_conversation should return empty DataFrame on DB failure"
+
+
 # ── Agentic wiring through app.py ───────────────────────────────
 def test_app_agentic_wired(monkeypatch, app_searcher, embeddings):
     """app.py must construct an AgenticDecider when agentic=True."""

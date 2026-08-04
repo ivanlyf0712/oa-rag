@@ -47,121 +47,144 @@ st.markdown("### Corporate Relationship & Chat Analytics")
 # ═══════════════════════════════════════ helpers ════════════════════════════════════
 @st.cache_data(ttl=30)
 def fetch_contacts():
-    conn = get_db_connection()
-    df = pd.read_sql(
-        "SELECT id, full_name, job_title, company, phone, email, userid, created_at FROM contacts ORDER BY created_at DESC",
-        conn
-    )
-    conn.close()
-    return df
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql(
+            "SELECT id, full_name, job_title, company, phone, email, userid, created_at FROM contacts ORDER BY created_at DESC",
+            conn
+        )
+        conn.close()
+        return df
+    except Exception as e:
+        st.warning(f"Contacts unavailable: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=30)
 def fetch_messages():
-    conn = get_db_connection()
-    df = pd.read_sql(
-        """SELECT id, msgid, open_kfid, external_userid, send_time, origin, 
-                  servicer_userid, msgtype, content, label, created_at 
-           FROM messages ORDER BY send_time DESC LIMIT 500""",
-        conn
-    )
-    conn.close()
-    return df
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql(
+            """SELECT id, msgid, open_kfid, external_userid, send_time, origin, 
+                      servicer_userid, msgtype, content, label, created_at 
+               FROM messages ORDER BY send_time DESC LIMIT 500""",
+            conn
+        )
+        conn.close()
+        return df
+    except Exception as e:
+        st.warning(f"Messages unavailable: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=60)
 def fetch_stats():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM contacts")
-    total_contacts = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM messages")
-    total_msgs = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(DISTINCT open_kfid) FROM messages")
-    total_convos = cur.fetchone()[0]
-    cur.execute("""
-        SELECT label, COUNT(*) 
-        FROM messages 
-        GROUP BY label 
-        ORDER BY COUNT(*) DESC
-    """)
-    label_counts = cur.fetchall()
-    cur.close()
-    conn.close()
-    return total_contacts, total_msgs, total_convos, label_counts
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM contacts")
+        total_contacts = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM messages")
+        total_msgs = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT open_kfid) FROM messages")
+        total_convos = cur.fetchone()[0]
+        cur.execute("""
+            SELECT label, COUNT(*) 
+            FROM messages 
+            GROUP BY label 
+            ORDER BY COUNT(*) DESC
+        """)
+        label_counts = cur.fetchall()
+        cur.close()
+        conn.close()
+        return total_contacts, total_msgs, total_convos, label_counts
+    except Exception as e:
+        st.warning(f"Statistics unavailable: {e}")
+        return 0, 0, 0, []
 
 # ── Chat viewer helpers ──
 def get_contact_name_map():
     """Return a dict {userid: full_name} for all contacts."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT userid, full_name FROM contacts")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return {row[0]: (row[1] if row[1] else row[0]) for row in rows}
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT userid, full_name FROM contacts")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {row[0]: (row[1] if row[1] else row[0]) for row in rows}
+    except Exception:
+        return {}
 
 def get_conversation_list(label_filter=None, search_term=None):
     """Return a list of distinct conversations with last message info."""
-    conn = get_db_connection()
-    cur = conn.cursor()
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-    # Build WHERE clause
-    conditions = []
-    params = []
-    if label_filter:
-        conditions.append("label = %s")
-        params.append(label_filter)
-    if search_term:
-        conditions.append("(external_userid ILIKE %s OR servicer_userid ILIKE %s)")
-        params.extend([f"%{search_term}%", f"%{search_term}%"])
+        # Build WHERE clause
+        conditions = []
+        params = []
+        if label_filter:
+            conditions.append("label = %s")
+            params.append(label_filter)
+        if search_term:
+            conditions.append("(external_userid ILIKE %s OR servicer_userid ILIKE %s)")
+            params.extend([f"%{search_term}%", f"%{search_term}%"])
 
-    where = " AND ".join(conditions) if conditions else "TRUE"
+        where = " AND ".join(conditions) if conditions else "TRUE"
 
-    # Get unique conversations (one row per open_kfid)
-    cur.execute(f"""
-        SELECT open_kfid,
-               MAX(external_userid) AS external_userid,
-               MAX(servicer_userid) AS servicer_userid,
-               MAX(send_time) AS last_time
-        FROM messages
-        WHERE {where}
-        GROUP BY open_kfid
-        ORDER BY last_time DESC
-        LIMIT 50
-    """, params)
+        # Get unique conversations (one row per open_kfid)
+        cur.execute(f"""
+            SELECT open_kfid,
+                   MAX(external_userid) AS external_userid,
+                   MAX(servicer_userid) AS servicer_userid,
+                   MAX(send_time) AS last_time
+            FROM messages
+            WHERE {where}
+            GROUP BY open_kfid
+            ORDER BY last_time DESC
+            LIMIT 50
+        """, params)
 
-    conversations = []
-    name_map = get_contact_name_map()
-    for row in cur.fetchall():
-        kfid, cust, agent, last_time = row
-        # Get last message content
-        cur.execute("SELECT content FROM messages WHERE open_kfid = %s ORDER BY send_time DESC LIMIT 1", (kfid,))
-        last_msg = cur.fetchone()
-        snippet = last_msg[0][:50] + "..." if last_msg and len(last_msg[0]) > 50 else (last_msg[0] if last_msg else "")
+        conversations = []
+        name_map = get_contact_name_map()
+        for row in cur.fetchall():
+            kfid, cust, agent, last_time = row
+            # Get last message content
+            cur.execute("SELECT content FROM messages WHERE open_kfid = %s ORDER BY send_time DESC LIMIT 1", (kfid,))
+            last_msg = cur.fetchone()
+            snippet = last_msg[0][:50] + "..." if last_msg and len(last_msg[0]) > 50 else (last_msg[0] if last_msg else "")
 
-        display_name = name_map.get(cust, cust)
-        conversations.append({
-            "open_kfid": kfid,
-            "display_name": display_name,
-            "snippet": snippet,
-            "last_time": last_time,
-            "cust": cust,
-            "agent": agent
-        })
+            display_name = name_map.get(cust, cust)
+            conversations.append({
+                "open_kfid": kfid,
+                "display_name": display_name,
+                "snippet": snippet,
+                "last_time": last_time,
+                "cust": cust,
+                "agent": agent
+            })
 
-    cur.close()
-    conn.close()
-    return conversations
+        cur.close()
+        conn.close()
+        return conversations
+    except Exception as e:
+        st.warning(f"Conversations unavailable: {e}")
+        return []
 
 def get_messages_for_conversation(open_kfid):
     """Fetch all messages for a given conversation, ordered by time."""
-    conn = get_db_connection()
-    df = pd.read_sql(
-        "SELECT msgid, external_userid, servicer_userid, send_time, origin, content "
-        "FROM messages WHERE open_kfid = %s ORDER BY send_time ASC",
-        conn, params=(open_kfid,)
-    )
-    conn.close()
-    return df
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql(
+            "SELECT msgid, external_userid, servicer_userid, send_time, origin, content "
+            "FROM messages WHERE open_kfid = %s ORDER BY send_time ASC",
+            conn, params=(open_kfid,)
+        )
+        conn.close()
+        return df
+    except Exception as e:
+        st.warning(f"Messages for conversation unavailable: {e}")
+        return pd.DataFrame()
 
 # ════════════════════════════════ Onyx 风格搜索（由 search.py 提供）═══════════════════════
 @st.cache_resource
