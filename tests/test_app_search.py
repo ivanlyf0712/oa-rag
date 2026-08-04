@@ -104,6 +104,7 @@ def _make_fake_streamlit():
     st.spinner = _noop_context
     st.expander = _noop_context
     st.chat_message = _noop_context
+    st.status = _noop_context
     st.tabs = lambda *a, **k: [_noop_context() for _ in (a[0] if a and isinstance(a[0], (list, tuple)) else a)]
     st.columns = lambda *a, **k: [_noop_context() for _ in range(len(a[0]) if a and isinstance(a[0], (list, tuple)) else (a[0] if a else 1))]
     st.button = lambda *a, **k: False

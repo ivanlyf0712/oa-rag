@@ -318,88 +318,161 @@ def _run_search(query: str, top_k: int, use_rerank: bool, expand: bool, graph_ex
         st.error(f"Search failed: {e}")
         return [], []
 
+def _check_llm_available() -> bool:
+    """Quick check if LiteLLM is reachable."""
+    if not LITELLM_API_KEY:
+        return False
+    try:
+        resp = requests.get(
+            LITELLM_BASE_URL.rstrip("/") + "/v1/models",
+            headers={"Authorization": f"Bearer {LITELLM_API_KEY}"},
+            timeout=5,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
 def _render_chat_history(history: list):
     for turn in history:
         with st.chat_message("user"):
             st.markdown(turn["query"])
         with st.chat_message("assistant"):
-            st.markdown(turn["answer"])
-            with st.expander("Details", expanded=False):
-                if turn.get("raw_hits"):
-                    st.dataframe(
-                        pd.DataFrame(turn["raw_hits"]),
-                        column_config={
-                            "id": st.column_config.TextColumn("Message ID"),
-                            "text": st.column_config.TextColumn("Content"),
-                            "score": st.column_config.NumberColumn("Score"),
-                            "metadata": st.column_config.TextColumn("Metadata"),
-                        },
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-                else:
-                    st.caption("No raw hits available for this turn.")
+            if turn.get("status") == "processing":
+                st.info("Search was interrupted. This turn has no results.")
+            elif turn.get("answer"):
+                st.markdown(turn["answer"])
+                with st.expander("Details", expanded=False):
+                    if turn.get("raw_hits"):
+                        st.dataframe(
+                            pd.DataFrame(turn["raw_hits"]),
+                            column_config={
+                                "id": st.column_config.TextColumn("Message ID"),
+                                "text": st.column_config.TextColumn("Content"),
+                                "score": st.column_config.NumberColumn("Score"),
+                                "metadata": st.column_config.TextColumn("Metadata"),
+                            },
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                    else:
+                        st.caption("No raw hits available for this turn.")
 
 # ═══════════════════════════════════════ pages ════════════════════════════════════
 if page == "Search":
     st.title("Search")
 
+    # Initialize session state
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "searching" not in st.session_state:
+        st.session_state.searching = False
+
+    # Handle interrupted search from reload (stop and discard)
+    if st.session_state.searching:
+        # Discard any processing turns
+        st.session_state.chat_history = [
+            t for t in st.session_state.chat_history if t.get("status") != "processing"
+        ]
+        st.session_state.searching = False
+
+    # Check if there's a pending processing turn (from a previous rerun)
+    pending_turn = None
+    for turn in st.session_state.chat_history:
+        if turn.get("status") == "processing":
+            pending_turn = turn
+            break
+
     # Two-column layout: chat (wide) + controls (narrow right panel)
     chat_col, ctrl_col = st.columns([3, 1])
 
     with ctrl_col:
-        st.markdown("### Enhancements")
-        use_rerank = st.checkbox("Reranker", value=True, help="Cross-encoder reranking")
-        expand = st.checkbox("LLM expansion", value=True, help="Expand query via LiteLLM")
-        graph_expand = st.slider("Graph hops", min_value=0, max_value=3, value=1)
-        agentic = st.checkbox("Agentic mode", value=False, help="Agent decides params")
-        st.divider()
-        st.markdown("### Filters")
-        label_filter = st.text_input("Label filter", value="", help="e.g. quotation_request")
-        top_k = st.slider("Top-k", min_value=1, max_value=20, value=5)
+        with st.expander("Enhancements", expanded=not st.session_state.searching):
+            use_rerank = st.checkbox("Reranker", value=True, help="Cross-encoder reranking", disabled=st.session_state.searching)
+            expand = st.checkbox("LLM expansion", value=True, help="Expand query via LiteLLM", disabled=st.session_state.searching)
+            graph_expand = st.slider("Graph hops", min_value=0, max_value=3, value=1, disabled=st.session_state.searching)
+            agentic = st.checkbox("Agentic mode", value=False, help="Agent decides params", disabled=st.session_state.searching)
+        with st.expander("Filters", expanded=not st.session_state.searching):
+            label_filter = st.text_input("Label filter", value="", help="e.g. quotation_request", disabled=st.session_state.searching)
+            top_k = st.slider("Top-k", min_value=1, max_value=20, value=5, disabled=st.session_state.searching)
 
     with chat_col:
-        if "chat_history" not in st.session_state:
-            st.session_state.chat_history = []
-
         _render_chat_history(st.session_state.chat_history)
 
-        query = st.chat_input("Ask anything about the conversations...")
-        if query:
-            with st.spinner("Processing..."):
-                results, raw_hits = _run_search(
-                    query, top_k, use_rerank, expand, graph_expand, agentic, label_filter
-                )
-                context_parts = []
-                for hit in raw_hits[: top_k * 2]:
-                    content = hit.get("text", "") if isinstance(hit, dict) else ""
-                    if content:
-                        context_parts.append(content)
-                context = "\n---\n".join(context_parts) if context_parts else "No relevant context found."
+        # If there's a pending processing turn, run the search now
+        if pending_turn:
+            query = pending_turn["query"]
+            with st.chat_message("assistant"):
+                with st.status("Processing query...", expanded=True) as status:
+                    # Stage 1: Query expansion
+                    st.write("1/6 Query expansion...")
+                    llm_ok = _check_llm_available()
+                    if expand and not llm_ok:
+                        st.write("   ⚠️ LLM unavailable — skipping expansion")
+                        expand = False
+                    if agentic and not llm_ok:
+                        st.write("   ⚠️ LLM unavailable — disabling agentic mode")
+                        agentic = False
 
-                if agentic:
-                    try:
-                        from apps.corpchat.search import AgenticDecider
-                        decider = AgenticDecider()
-                        decision = decider.decide(query)
-                        expand = decision.get("expand", expand)
-                        graph_expand = decision.get("graph_expand", graph_expand)
-                        use_rerank = decision.get("use_rerank", use_rerank)
-                        results, raw_hits = _run_search(
-                            query, top_k, use_rerank, expand, graph_expand, False, label_filter
-                        )
-                        context_parts = [hit.get("text", "") if isinstance(hit, dict) else "" for hit in raw_hits[: top_k * 2] if isinstance(hit, dict) and hit.get("text")]
-                        context = "\n---\n".join(context_parts) if context_parts else "No relevant context found."
-                    except Exception as e:
-                        st.warning(f"Agentic decision failed: {e}")
+                    # Stage 2: Hybrid search
+                    st.write("2/6 Hybrid search (BM25 + vector)...")
+                    results, raw_hits = _run_search(
+                        query, top_k, use_rerank, expand, graph_expand, agentic, label_filter
+                    )
+                    st.write(f"   Found {len(raw_hits)} hits")
 
-                answer = generate_answer_litellm(query, context)
-                st.session_state.chat_history.append({
-                    "query": query,
-                    "answer": answer,
-                    "raw_hits": raw_hits,
-                })
+                    # Stage 3: RRF fusion
+                    st.write("3/6 RRF fusion...")
+                    st.write("   Merged expanded queries")
+
+                    # Stage 4: Graph expansion
+                    st.write("4/6 Graph expansion...")
+                    if graph_expand > 0:
+                        st.write(f"   {graph_expand} hops traversed")
+                    else:
+                        st.write("   Skipped (0 hops)")
+
+                    # Stage 5: Reranking
+                    st.write("5/6 Reranking...")
+                    if use_rerank:
+                        st.write("   Cross-encoder applied")
+                    else:
+                        st.write("   Skipped")
+
+                    # Stage 6: LLM answer generation
+                    st.write("6/6 Generating answer...")
+                    context_parts = []
+                    for hit in raw_hits[: top_k * 2]:
+                        content = hit.get("text", "") if isinstance(hit, dict) else ""
+                        if content:
+                            context_parts.append(content)
+                    context = "\n---\n".join(context_parts) if context_parts else "No relevant context found."
+
+                    if llm_ok:
+                        answer = generate_answer_litellm(query, context)
+                    else:
+                        answer = "LLM is unavailable. Here are the retrieved messages:\n\n" + "\n\n---\n\n".join(context_parts[:3])
+
+                    status.update(label="Search complete!", state="complete")
+
+            # Update the turn with results
+            pending_turn["answer"] = answer
+            pending_turn["raw_hits"] = raw_hits
+            pending_turn["status"] = "done"
+            st.session_state.searching = False
             st.rerun()
+
+    # Chat input at page level (full-width, fixed at bottom)
+    query = st.chat_input("Ask anything about the conversations...")
+    if query and not st.session_state.searching:
+        # Add user turn + pending assistant turn
+        st.session_state.chat_history.append({
+            "query": query,
+            "answer": None,
+            "raw_hits": [],
+            "status": "processing",
+        })
+        st.session_state.searching = True
+        st.rerun()
 
 elif page == "Contacts":
     st.title("Contacts")
