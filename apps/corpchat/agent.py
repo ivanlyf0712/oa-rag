@@ -424,6 +424,9 @@ class Agent:
                 llm_ok = self.classifier._check_llm()
                 if llm_ok and LITELLM_API_KEY:
                     answer = self._generate_answer(query, context)
+                    if answer is None:
+                        # LLM failed — fall back to formatted results
+                        answer = self._format_results_as_answer(query, results)
                 else:
                     # Fallback: show top results
                     answer = self._format_results_as_answer(query, results)
@@ -459,7 +462,7 @@ class Agent:
             self._add_to_history(query, response)
             return intent, response, []
 
-    def _generate_answer(self, query: str, context: str) -> str:
+    def _generate_answer(self, query: str, context: str) -> Optional[str]:
         """Generate LLM answer (requires LiteLLM)."""
         try:
             import requests
@@ -486,7 +489,7 @@ class Agent:
             return resp.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
             logger.warning(f"LLM answer generation failed: {e}")
-            return self._format_results_as_answer(query, [])
+            return None
 
     def _format_results_as_answer(self, query: str, results: List[Dict]) -> str:
         """Format search results as a readable answer (fallback when LLM is down)."""
