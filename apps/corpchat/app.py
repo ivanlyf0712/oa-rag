@@ -35,6 +35,18 @@ from apps.corpchat.search import (
     DEFAULT_INDEX_PATH,
 )
 
+# ── Agentic intent gate (greeting/system_info skip search) ──
+from apps.corpchat.agent import (
+    Agent,
+    IntentClassifier,
+    INTENT_GREETING,
+    INTENT_SYSTEM_INFO,
+    INTENT_CLARIFY,
+)
+
+# Module-level intent classifier (cached across renders — deterministic")
+_intent_classifier = IntentClassifier()
+
 # ── LiteLLM config ──
 import os as _os
 LITELLM_API_KEY = _os.getenv("LITELLM_API_KEY", "")
@@ -337,8 +349,10 @@ def _render_chat_history(history: list):
         with st.chat_message("user"):
             st.markdown(turn["query"])
         with st.chat_message("assistant"):
-            if turn.get("status") == "processing":
+            if turn.get("interrupted"):
                 st.info("Search was interrupted. This turn has no results.")
+            elif turn.get("status") == "processing":
+                st.markdown("_Processing your request…_")
             elif turn.get("answer"):
                 st.markdown(turn["answer"])
                 with st.expander("Details", expanded=False):
@@ -358,7 +372,8 @@ def _render_chat_history(history: list):
                         st.caption("No raw hits available for this turn.")
 
 # ═══════════════════════════════════════ pages ════════════════════════════════════
-if page == "Search":
+def _render_search_page():
+    """Render the Search page (kept callable so tests can drive it)."""
     st.title("Search")
 
     # Initialize session state
@@ -378,21 +393,45 @@ if page == "Search":
     chat_col, ctrl_col = st.columns([3, 1])
 
     with ctrl_col:
-        with st.expander("Enhancements", expanded=not st.session_state.searching):
+        with st.expander("Enhancements", expanded=False):
             use_rerank = st.checkbox("Reranker", value=True, help="Cross-encoder reranking", disabled=st.session_state.searching)
             expand = st.checkbox("LLM expansion", value=True, help="Expand query via LiteLLM", disabled=st.session_state.searching)
             graph_expand = st.slider("Graph hops", min_value=0, max_value=3, value=1, disabled=st.session_state.searching)
             agentic = st.checkbox("Agentic mode", value=False, help="Agent decides params", disabled=st.session_state.searching)
-        with st.expander("Filters", expanded=not st.session_state.searching):
+        with st.expander("Filters", expanded=False):
             label_filter = st.text_input("Label filter", value="", help="e.g. quotation_request", disabled=st.session_state.searching)
             top_k = st.slider("Top-k", min_value=1, max_value=20, value=5, disabled=st.session_state.searching)
 
     with chat_col:
         _render_chat_history(st.session_state.chat_history)
 
-        # If there's a pending processing turn, run the search now
+        # If there's a pending processing turn, handle it now
         if pending_turn:
             query = pending_turn["query"]
+
+            # ── Intent gate: greeting/system_info/clarify skip search ──
+            intent = _intent_classifier.classify(query)
+            if intent in (INTENT_GREETING, INTENT_SYSTEM_INFO, INTENT_CLARIFY):
+                if intent == INTENT_GREETING:
+                    answer = Agent._GREETING_RESPONSE
+                elif intent == INTENT_SYSTEM_INFO:
+                    answer = Agent._SYSTEM_INFO_RESPONSE
+                else:
+                    answer = (
+                        "I'd be happy to clarify! Could you rephrase your question or "
+                        "provide more specific details about what you're looking for?"
+                    )
+                # Render a plain reply — no search, no progress window
+                with st.chat_message("assistant"):
+                    st.markdown(answer)
+                pending_turn["answer"] = answer
+                pending_turn["raw_hits"] = []
+                pending_turn["status"] = "done"
+                st.session_state.searching = False
+                st.rerun()
+                return
+
+            # ── Real search intent: run the full pipeline ──
             with st.chat_message("assistant"):
                 with st.status("Processing query...", expanded=True) as status:
                     # Stage 1: Query expansion
@@ -465,6 +504,10 @@ if page == "Search":
         })
         st.session_state.searching = True
         st.rerun()
+
+
+if page == "Search":
+    _render_search_page()
 
 elif page == "Contacts":
     st.title("Contacts")

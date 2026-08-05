@@ -195,7 +195,7 @@ class IntentClassifier:
         try:
             import requests
             resp = requests.post(
-                LITELLM_BASE_URL.rstrip("/") + "/chat/completions",
+                LITELLM_BASE_URL.rstrip("/") + "/v1/chat/completions",
                 json={
                     "model": LITELLM_MODEL,
                     "messages": [
@@ -467,7 +467,7 @@ class Agent:
         try:
             import requests
             resp = requests.post(
-                LITELLM_BASE_URL.rstrip("/") + "/chat/completions",
+                LITELLM_BASE_URL.rstrip("/") + "/v1/chat/completions",
                 json={
                     "model": LITELLM_MODEL,
                     "messages": [

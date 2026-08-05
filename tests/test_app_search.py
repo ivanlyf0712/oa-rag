@@ -353,13 +353,17 @@ def test_app_rerank_improves_or_matches_base(monkeypatch, app_searcher, embeddin
 
 # ── Graceful DB failure (app must not crash when Postgres is down) ──
 def test_app_loads_litellm_env(monkeypatch):
-    """app.py must read LITELLM vars from .env so the UI can reach the server."""
+    """app.py must read LITELLM vars from .env so the UI can reach an LLM server.
+
+    The backend is configurable (remote LiteLLM proxy or local Ollama); the
+    test only requires that an OpenAI-compatible endpoint + model are configured.
+    """
     # Ensure the module-level vars were populated from .env
     assert app_module.LITELLM_API_KEY, "LITELLM_API_KEY not loaded from .env"
     assert app_module.LITELLM_BASE_URL, "LITELLM_BASE_URL not loaded from .env"
     assert app_module.LITELLM_MODEL, "LITELLM_MODEL not loaded from .env"
-    # BASE_URL must point at the running LiteLLM proxy
-    assert "litellm" in app_module.LITELLM_BASE_URL, (
+    # BASE_URL must be an HTTP(S) endpoint for an OpenAI-compatible LLM server
+    assert app_module.LITELLM_BASE_URL.startswith(("http://", "https://")), (
         f"Unexpected LITELLM_BASE_URL: {app_module.LITELLM_BASE_URL}"
     )
 
