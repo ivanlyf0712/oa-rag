@@ -232,15 +232,18 @@ class TestGracefulDegradation:
         assert intent == INTENT_SYSTEM_INFO
         assert len(results) == 0
 
-    def test_llm_down_no_results_message(self, agent_llm_down, classifier_llm_down):
-        """When search returns empty results, user gets helpful message."""
-        # Use a mock searcher that returns empty results to test the no-results path
-        from unittest.mock import patch
-        with patch.object(agent_llm_down, 'searcher') as mock_searcher:
-            mock_searcher.search.return_value = []
-            intent, response, results = agent_llm_down.process(
-                "xyzzy_nothing_here_zzz", top_k=5, use_rerank=False, expand=False, graph_expand=0
-            )
+    def test_llm_down_no_results_message(self, agent_llm_down):
+        """When search returns genuinely empty results, user gets helpful message.
+
+        Uses a label_filter that does not exist in the corpus, which drives the
+        REAL Searcher to an empty result set (txtai fuzzy matching never returns
+        empty for arbitrary text, so an impossible label is the deterministic,
+        integration-level way to exercise the no-results path).
+        """
+        intent, response, results = agent_llm_down.process(
+            "物流", top_k=5, use_rerank=False, expand=False, graph_expand=0,
+            label_filter="__no_such_label__"
+        )
         assert intent == INTENT_SEARCH
         assert results == []
         assert "couldn't find" in response.lower() or "No relevant" in response
