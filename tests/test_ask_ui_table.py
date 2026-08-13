@@ -129,9 +129,8 @@ def test_empty_result_set_yields_empty_table_with_columns():
 
 def test_base_columns_cover_spec_and_extras_exist():
     # spec: ref, counterparty/title, type, status, dates, amount, risk
-    for col in ("ref_no", "title", "counterparty_name", "contract_type",
-                "status", "contract_start_date", "contract_end_date",
-                "amount_label", "risk_score", "risk_severity"):
+    for col in ("ref_no", "counterparty_name", "contract_type",
+                "status", "amount_label", "risk_score", "risk_severity"):
         assert col in _TABLE_BASE_COLUMNS
     for col in ("matched_signals", "risk_explanation", "snippet"):
         assert col in _TABLE_EXTRA_COLUMNS

@@ -248,6 +248,7 @@ def _load_sections(index_path: str) -> pd.DataFrame:
             "requested_date": meta.get("requested_date"),
             "status": meta.get("status_label") or meta.get("status"),
             "contract_type": meta.get("contract_type"),
+            "contract_type_label": meta.get("contract_type_label"),
             "chunk_index": meta.get("chunk_index"),
         }
         # Flatten every decoded label present in the data (e.g. Over5M -> "yes").
@@ -310,7 +311,7 @@ def _summarize_results(results: List[Dict[str, Any]]) -> pd.DataFrame:
             "score": r.get("score"),
             "counterparty_name": meta.get("counterparty_name"),
             "department": meta.get("department"),
-            "contract_type": meta.get("contract_type"),
+            "contract_type": meta.get("contract_type_label") or meta.get("contract_type"),
             "requested_date": meta.get("requested_date"),
             "status": meta.get("status_label") or meta.get("status"),
             "amount_label": meta.get("amount_label"),
@@ -394,9 +395,8 @@ def _render_agentic(index_path: str):
 DEFAULT_MIN_RISK_SCORE = 80
 
 _TABLE_BASE_COLUMNS = [
-    "ref_no", "title", "counterparty_name", "contract_type", "status",
-    "contract_start_date", "contract_end_date", "amount_label",
-    "risk_score", "risk_severity",
+    "ref_no", "counterparty_name", "contract_type", "status",
+    "amount_label", "risk_score", "risk_severity",
 ]
 _TABLE_EXTRA_COLUMNS = [
     "department", "requested_date", "expired", "matched_signals",
@@ -414,7 +414,7 @@ def _flatten_result_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "ref_no": meta.get("ref_no") or r.get("ref_no"),
             "title": meta.get("title"),
             "counterparty_name": meta.get("counterparty_name"),
-            "contract_type": meta.get("contract_type"),
+            "contract_type": meta.get("contract_type_label") or meta.get("contract_type"),
             "status": meta.get("status_label") or meta.get("status"),
             "contract_start_date": meta.get("contract_start_date") or meta.get("requested_date"),
             "contract_end_date": meta.get("contract_end_date"),
@@ -484,26 +484,26 @@ def _render_agentic_contract(result: Dict[str, Any], searcher: Searcher):
     #    filter (default 80), column picker. The store keeps the full set.
     key_suffix = re.sub(r"[^0-9A-Za-z]+", "_", t_query or "results")[-40:]
     flat = _flatten_result_rows(rows)
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2 = st.columns([1, 3])
     with c1:
         rank_by_risk = st.toggle(
             "Rank by risk",
             value=(snap.get("rank_by") == "risk"),
             key="rank_risk_" + key_suffix,
         )
-    with c2:
-        min_score = st.number_input(
-            "Min risk score", min_value=0, max_value=1000,
-            value=DEFAULT_MIN_RISK_SCORE, step=10,
-            key="min_score_" + key_suffix,
-        )
-    with c3:
-        columns = st.multiselect(
-            "Columns", _TABLE_BASE_COLUMNS + _TABLE_EXTRA_COLUMNS,
-            default=_TABLE_BASE_COLUMNS, key="cols_" + key_suffix,
-        )
+        last_score_key = "last_min_score_" + key_suffix
+        if last_score_key not in st.session_state:
+            st.session_state[last_score_key] = DEFAULT_MIN_RISK_SCORE
+        if rank_by_risk:
+            st.session_state[last_score_key] = st.number_input(
+                "Min risk score", min_value=0, max_value=1000,
+                value=st.session_state[last_score_key], step=10,
+                key="min_score_" + key_suffix,
+            )
+        min_score = st.session_state[last_score_key] if rank_by_risk else 0
     table = _apply_table_controls(
-        flat, rank_by_risk=rank_by_risk, min_score=min_score, columns=columns)
+        flat, rank_by_risk=rank_by_risk, min_score=min_score,
+        columns=st.session_state.get("sidebar_columns_", _TABLE_BASE_COLUMNS))
     st.success(f"{len(table)} of {len(flat)} supporting contract(s) shown")
     st.dataframe(table, use_container_width=True)
     obs_count = snap.get("observation_count")
@@ -697,7 +697,7 @@ def _render_browser(index_path: str):
     # Primary readable grid vs. full column set (all content-bearing fields).
     base_cols = [
         "id", "ref_no", "title", "counterparty_name", "department",
-        "amount_label", "requested_date", "status", "contract_type",
+        "amount_label", "requested_date", "status", "contract_type_label",
     ]
     show_all = st.checkbox(
         "Show all columns (all content-bearing raw + decoded fields)", value=False
@@ -709,7 +709,11 @@ def _render_browser(index_path: str):
     else:
         keep = [c for c in base_cols if c in filtered.columns]
         keep += [f for f in ("Over5M", "Over100M", "FlagNeedLegal", "IsRisksAccepted") if f in filtered.columns]
-        display_df = filtered[keep]
+        display_df = filtered[keep].copy()
+        # Show contract_type_label when available instead of raw code
+        if "contract_type_label" in display_df.columns and "contract_type" in display_df.columns:
+            display_df["contract_type"] = display_df["contract_type_label"]
+            display_df = display_df.drop(columns=["contract_type_label"])
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     # Per-record detail (merged 4-tab view, same function as search results).
@@ -776,6 +780,14 @@ def main():
         )
     else:
         st.caption("LLM ready: " + chr(96) + str(health.get("model")) + chr(96))
+    # Settings expander in sidebar: column picker (moved inline to save space)
+    with st.sidebar.expander("Settings"):
+        sidebar_cols = st.multiselect(
+            "Table columns", _TABLE_BASE_COLUMNS + _TABLE_EXTRA_COLUMNS,
+            default=_TABLE_BASE_COLUMNS, key="sidebar_columns_picker",
+        )
+        st.session_state["sidebar_columns_"] = sidebar_cols
+
     # On-demand live generation probe (off the per-rerun critical path).
     if st.sidebar.button("Recheck LLM (live probe)"):
         check_llm_health.clear()

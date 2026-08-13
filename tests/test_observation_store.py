@@ -308,7 +308,7 @@ def test_render_agentic_contract_uses_result_store(monkeypatch):
         @staticmethod
         def toggle(label, value=False, key=None):
             captured.setdefault("toggle_default", value)
-            return value
+            return True  # enable rank_by_risk so number_input appears
 
         @staticmethod
         def number_input(label, min_value=None, max_value=None, value=None, step=None, key=None):
@@ -341,8 +341,9 @@ def test_render_agentic_contract_uses_result_store(monkeypatch):
     df = captured["df"]
     assert isinstance(df, pd.DataFrame)
     assert df.iloc[0]["ref_no"] == "R1"
-    assert captured["min_score_default"] == 80  # UI-only default
-    assert "risk_score" in captured["columns_default"]
+    # min_score is stored in session_state; number_input called with DEFAULT_MIN_RISK_SCORE
+    assert captured["min_score_default"] == 80
+    # Column picker was moved to sidebar (tested in main() scope, not here)
 
 
 def test_render_agentic_contract_falls_back_without_stash(monkeypatch):
