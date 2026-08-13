@@ -1,0 +1,31 @@
+# VCS / local state
+.git
+.gitignore
+.scratch
+.pytest_cache
+__pycache__
+*.pyc
+*~
+*.swp
+.DS_Store
+
+# Local environments & secrets
+venv
+.venv
+.env
+.env.bak
+*.log
+
+# Not needed in the image
+tests
+docs
+data
+lib
+models
+
+# Docs
+STATUS_REPORT.md
+HANDOFF.md
+AGENTS.md
+CLAUDE.md
+CONTEXT.md

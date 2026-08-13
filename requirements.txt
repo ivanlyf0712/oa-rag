@@ -33,7 +33,7 @@ packaging==26.2
 pandas==3.0.3
 pillow==12.3.0
 protobuf==7.35.1
-psycopg2-binary==2.9.12
+pymysql==1.1.1
 pyarrow==24.0.0
 pydantic==2.13.4
 pydantic_core==2.46.4
@@ -61,3 +61,15 @@ urllib3==2.7.0
 uvicorn==0.51.0
 watchdog==6.0.0
 websockets==16.1
+
+# ── LangChain agentic layer (Ticket 5) ──
+# Minimal, provider-agnostic tool-calling set for the unified agentic UI.
+# langchain-core supplies the @tool / chat-model abstractions; langchain-ollama
+# is the local model provider used for tool calling (configured via LITELLM_*).
+langchain-core==1.5.3
+langchain-ollama==1.1.0
+# langgraph provides langgraph.prebuilt.create_react_agent, the ReAct tool-calling
+# loop used for routing ambiguous queries. Without it the agent silently degrades
+# to the deterministic router fallback for every non-fast-route query.
+langgraph==1.2.11
+python-docx==1.2.0

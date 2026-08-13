@@ -1,67 +1,44 @@
 # ──────────────────── Configuration ────────────────────
+"""Live runtime config: MySQL connection + HF cache auto-detection.
+
+The OCR/invoice-era constants that used to live here belonged to the
+pre-migration codebase and had no remaining importers — removed.
+"""
 import os
 
-# ── OCR: Server mode (primary, faster) ──
-OCR_MODE = "server"               # "server" | "cli"
-OCR_SERVER_URL = "http://127.0.0.1:8081/v1/chat/completions"
-OCR_SERVER_MODEL = "Unlimited-OCR"
-OCR_SERVER_PROMPT = "Please OCR the text in this image."
-OCR_SERVER_TEMPERATURE = 0.0
-OCR_SERVER_MAX_TOKENS = 32768
-OCR_SERVER_REPEAT_PENALTY = 1.1
+import pymysql
 
-# ── OCR: CLI mode (fallback, uses subprocess) ──
-LLAMA_CLI = os.path.expanduser("~/llama.cpp/build/bin/llama-mtmd-cli")
-UOCR_MODEL = os.path.expanduser("~/uocr/Unlimited-OCR-Q4_K_M.gguf")
-UOCR_MMPROJ = os.path.expanduser("~/uocr/mmproj-Unlimited-OCR-F16.gguf")
 
-# ── Image preprocessing ──
-MAX_LONG_EDGE = 512              # server can handle larger images
-JPEG_QUALITY = 60
+# ── MySQL — contract screening data source ──
 
-# Ollama
-OLLAMA_URL = "http://127.0.0.1:11434"
-TEXT_MODEL = "qwen2.5:1.5b"      # JSON extraction model
-EMBED_MODEL = "mxbai-embed-large"
-RAG_MODEL = "qwen2.5:1.5b"       # RAG answer generation model
+def build_db_config():
+    return {
+        "host": os.getenv("DB_HOST", "localhost"),
+        "port": int(os.getenv("DB_PORT", "3306")),
+        "user": os.getenv("DB_USER", "root"),
+        "password": os.getenv("DB_PASSWORD", ""),
+        "database": os.getenv("DB_NAME", "oa_rag"),
+        "charset": os.getenv("DB_CHARSET", "utf8mb4"),
+        "cursorclass": pymysql.cursors.DictCursor,
+    }
 
-# llama-server for multi-page mode (used by pipeline_fast.py)
-LLAMA_SERVER_URL = "http://127.0.0.1:8081/v1/chat/completions"
 
-# PostgreSQL
-DB_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "user": "ocr",
-    "password": "ocrpass",
-    "dbname": "invoices"
-}
+# ── HuggingFace offline auto-detection ──
 
-# JSON extraction prompts
-JSON_PROMPT = """Return a single JSON object with these keys:
-"invoice_number", "date", "vendor_name", "total_amount", "currency".
+def ensure_hf_offline() -> None:
+    """Set HF_HUB_OFFLINE from cache state when it is not explicitly set.
 
-Rules:
-- Use the exact text from the invoice. Do NOT invent or guess any values.
-- If a field is missing, set it to "".
-- "total_amount" must contain only the number (e.g. "1250.00"), without currency symbol.
-- "currency" must be the three‑letter currency code (e.g. "USD").
-- Do NOT use nested objects.
-
-Invoice text:
-___RAW_TEXT___
-
-JSON:"""
-
-FALLBACK_PROMPT = """Extract these fields from the invoice text.
-Do NOT use any of the following words: value, text, string, example, placeholder, xxxx.
-Return ONLY a valid JSON object with the keys:
-"invoice_number", "date", "vendor_name", "total_amount", "currency".
-"total_amount" must be a plain number (e.g. "1250.00").
-"currency" must be a three‑letter code (e.g. "USD").
-If a field is truly missing, leave it as "".
-
-Invoice text:
-___RAW_TEXT___
-
-JSON:"""
+    A fresh container starts with an empty hf-cache volume: forcing offline
+    there breaks the first model load; forcing online on a primed cache adds
+    hub latency to every start. Detect instead. Must run before any
+    transformers / sentence-transformers / txtai import.
+    """
+    if os.getenv("HF_HUB_OFFLINE"):
+        return
+    try:
+        cache = os.getenv("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        slug = "models--" + os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3").replace("/", "--")
+        present = os.path.isdir(os.path.join(cache, "hub", slug))
+        os.environ["HF_HUB_OFFLINE"] = "1" if present else "0"
+    except Exception:
+        pass

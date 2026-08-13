@@ -1,0 +1,73 @@
+# OA Contract RAG — one-command stack
+# ===================================
+#   docker compose up -d --build   # start everything (or: make up)
+#   make db-import                 # one-time: copy host MySQL data into the stack
+#   docker compose logs -f app     # follow app logs
+#   docker compose down            # stop (data volumes kept)
+#
+# Services:
+#   mysql — MySQL 8 for contract data (form tables + contract_attachments).
+#           Host port 3307 -> 3306 (3306 is taken by the local MySQL).
+#   app   — Streamlit UI on :8501 (agent + search + detail views).
+#
+# Named volumes (created automatically, image content copied up on first run):
+#   oa-mysql-data — database files; oa-uploads — contract attachment files;
+#   oa-index — search index (refresh with: make index);
+#   hf-cache — bge-m3 / reranker model cache (~3.5G, avoids re-download).
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: oa-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD must be set in .env (see .env.example)}
+      MYSQL_DATABASE: ${DB_NAME:-oa_rag}
+      MYSQL_USER: ${DB_USER:?DB_USER must be set in .env}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+    ports:
+      - "3307:3306"
+    volumes:
+      - oa-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+
+  app:
+    build: .
+    image: oa-rag
+    container_name: oa-rag
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${DB_NAME:-oa_rag}
+      DB_USER: ${DB_USER:?DB_USER must be set in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      DB_CHARSET: ${DB_CHARSET:-utf8mb4}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:?LITELLM_API_KEY must be set in .env}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-https://litellm.dchbi.app/}
+      LITELLM_MODEL: ${LITELLM_MODEL:-dseek-v4-flash}
+      LITELLM_TIMEOUT: ${LITELLM_TIMEOUT:-45}
+      LITELLM_MAX_TOKENS: ${LITELLM_MAX_TOKENS:-2048}
+      UPLOADS_ROOT: /app/uploads
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-base}
+      INDEX_PATH: /app/apps/search_index
+    ports:
+      - "8501:8501"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - oa-uploads:/app/uploads
+      - oa-index:/app/apps/search_index
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  oa-mysql-data:
+  hf-cache:
+  oa-uploads:
+  oa-index:

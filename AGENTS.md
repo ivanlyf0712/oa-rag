@@ -5,7 +5,7 @@
 When running ad-hoc Python experiments or one-off verification scripts, do NOT type long inline `python -c "..."` commands into the terminal (they are error-prone). Instead:
 
 1. Create a temporary script file in the repo root named with a leading underscore, e.g. `_test.py` or `_test_llm_expansion.py`.
-2. Run it with the appropriate interpreter, e.g. `/Users/ivanlee/miniconda3/envs/ocr/bin/python _test.py`.
+2. Run it with the appropriate interpreter, e.g. `venv/bin/python _test.py`.
 3. Delete the temp file afterward.
 
 ## Agent skills
