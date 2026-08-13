@@ -32,7 +32,7 @@ CONTEXTUAL_GROUPS: Tuple[Tuple[str, Tuple[Tuple[str, Tuple[str, ...]], ...]], ..
         ("Title", ("title", "TitleReferenceNoOfContract")),
         ("Counterparty", ("counterparty_name", "CounterpartyName")),
         ("Department", ("department", "businessunit")),
-        ("Contract type", ("contract_type", "contracttype")),
+        ("Contract type", ("contract_type_label", "contract_type", "contracttype")),
         ("Start date", ("contract_start_date", "contractstartdate")),
         ("End date", ("contract_end_date", "contractenddate")),
         ("Requested date", ("requested_date",)),

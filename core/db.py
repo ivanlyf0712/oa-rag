@@ -115,12 +115,32 @@ STATUS_LABELS = {
     7: "Completed",
 }
 
+CONTRACT_TYPE_LABELS = {
+    0: "NDA / Confidentiality Agreement",
+    1: "MOU / LOI",
+    2: "Sales Agreement / Service Agreement / Quotation",
+    3: "Distribution Agreement / Dealership Agreement",
+    4: "Procurement Agreement / Quotation (BU Principal/Supplier Contract)",
+    5: "Procurement Agreement / Quotation (Functional Purchase)",
+    6: "Lease or Rental Agreement",
+    7: "Others",
+}
+
 
 def _status_label(value: Any) -> str:
     if value in (None, ""):
         return ""
     try:
         return STATUS_LABELS.get(int(value), str(value))
+    except Exception:
+        return str(value)
+
+
+def _contract_type_label(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        return CONTRACT_TYPE_LABELS.get(int(value), str(value))
     except Exception:
         return str(value)
 
@@ -352,6 +372,7 @@ def _normalize_contract_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "is_deleted": _pick_first(record, "isDeleteProcess"),
         "ref_no": _pick_text(record, "RefNo"),
         "contract_type": _pick_first(record, "contracttype", "contract_type"),
+        "contract_type_label": _contract_type_label(_pick_first(record, "contracttype", "contract_type")),
         # new de-normalized structures
         "decoded_fields": decoded_fields,
         "contextual_fields": contextual_fields,

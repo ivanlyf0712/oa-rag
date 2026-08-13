@@ -319,6 +319,7 @@ class IndexBuilder:
                     "status": contract.get("status"),
                     "status_label": contract.get("status_label"),
                     "contract_type": contract.get("contract_type"),
+                    "contract_type_label": contract.get("contract_type_label"),
                     "legal_approval": contract.get("legal_approval"),
                     "overruled": contract.get("overruled"),
                     # de-normalized raw-first structures for filter / display

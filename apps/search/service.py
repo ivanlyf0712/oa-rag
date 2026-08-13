@@ -584,7 +584,9 @@ class ContractSearchService:
         ctype = filters.get("contract_type")
         if ctype:
             wanted = {p.strip() for p in str(ctype).split(",") if p.strip()}
-            if str(meta.get("contract_type") or "") not in wanted:
+            actual = str(meta.get("contract_type") or "")
+            actual_label = str(meta.get("contract_type_label") or "")
+            if actual not in wanted and actual_label.lower() not in {w.lower() for w in wanted}:
                 return False
 
         date_from = filters.get("date_from")
@@ -619,7 +621,7 @@ def format_contract_observation(
         meta = r.get("metadata", {})
         ref = meta.get("ref_no") or "?"
         party = meta.get("counterparty_name") or meta.get("title") or "?"
-        ctype = meta.get("contract_type", "-")
+        ctype = meta.get("contract_type_label") or meta.get("contract_type", "-")
         status = meta.get("status_label") or meta.get("status") or "-"
         start = meta.get("contract_start_date") or meta.get("requested_date") or "-"
         end = meta.get("contract_end_date") or "-"
@@ -655,6 +657,6 @@ def format_contract_results(results: List[Dict[str, Any]]) -> str:
         text = _clean_text_from_enriched(r.get("text", ""))[:200]
         ref = meta.get("ref_no") or "?"
         party = meta.get("counterparty_name") or meta.get("title") or "?"
-        ctype = meta.get("contract_type", "-")
+        ctype = meta.get("contract_type_label") or meta.get("contract_type", "-")
         out.append(f"{i}. [ref={ref} | {party} | type={ctype}] {text}")
     return "\n".join(out)
