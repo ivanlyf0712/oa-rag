@@ -105,6 +105,7 @@ _CODE_LABELS = {
 }
 
 STATUS_LABELS = {
+    0: "Draft",
     1: "Pending Preliminary Review",
     2: "Returned from Preliminary Review",
     3: "Pending Final Draft",

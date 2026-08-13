@@ -118,7 +118,7 @@ def make_rows(count, seed):
             "contractenddate": end.isoformat() if end else "",
             "requested_date": (start - timedelta(days=14)).isoformat(),
             "requested_time": "10:00:00",
-            "Status": rng.randint(1, 7),
+            "Status": rng.randint(0, 7),
             "contracttype": rng.choice(CONTRACT_TYPES),
             "isDeleteProcess": 0,
             "reviewtier": rng.choice([1, 2, 3]),
