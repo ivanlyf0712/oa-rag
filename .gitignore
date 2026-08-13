@@ -11,6 +11,14 @@ build/
 *.swp
 
 # Search index & models (build artifacts, machine-specific)
-apps/corpchat/search_index/
+apps/search_index/
 models/
 .pytest_cache/
+
+# Uploaded contract files (user data)
+uploads/
+
+# Real data — never commit
+data/*.csv
+data/*.sql
+*.bak
