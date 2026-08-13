@@ -28,19 +28,16 @@ def _build_via_search_module(force: bool = False,
                               graph_mode: str = "auto",
                               chunk_size: int = 256,
                               index_path: str | None = None) -> int:
-    search_path = os.path.join(ROOT_DIR, "apps", "search.py")
-    spec = importlib.util.spec_from_file_location("search_module", search_path)
-    search_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(search_module)
+    from apps.search import DEFAULT_INDEX_PATH, IndexBuilder
 
-    builder = search_module.IndexBuilder(
-        index_path=index_path or search_module.DEFAULT_INDEX_PATH,
+    builder = IndexBuilder(
+        index_path=index_path or DEFAULT_INDEX_PATH,
         chunk_size=chunk_size,
     )
     enable_graph = graph_mode != "off"
     embeddings = builder.build(force=force, enable_graph=enable_graph, graph_mode=graph_mode)
     count = embeddings.count()
-    logger.info(f"索引构建完成: {count} 个文档块 (图: {'✅' if embeddings.graph else '❌'})")
+    logger.info("index build done: %d chunks (graph: %s)", count, bool(embeddings.graph))
     return count
 
 
