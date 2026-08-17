@@ -57,8 +57,10 @@ from apps.search.intents import (
     INTENT_GENERAL,
     INTENT_RISK,
     INTENT_TO_TOOL,
+    TOOL_CONTRACT_DETAIL,
     TOOL_CONTRACT_SEARCH,
     TOOL_CONTRACTS_AGGREGATE,
+    TOOL_CONTRACTS_COMPARE,
     TOOL_CONTRACTS_WHERE,
     TOOL_NONE,
     default_decision,
@@ -187,6 +189,8 @@ def build_langchain_tools(
     contract_tool: ContractTool,
     where_tool: Optional[Callable[[str], str]] = None,
     aggregate_tool: Optional[Callable[..., str]] = None,
+    detail_tool: Optional[Callable[[str], str]] = None,
+    compare_tool: Optional[Callable[..., str]] = None,
 ) -> List[Any]:
     """Wrap the raw callables as LangChain @tool objects.
 
@@ -287,6 +291,39 @@ def build_langchain_tools(
             return aggregate_tool(metric, group_by, condition)
 
         tools.append(contracts_aggregate)
+
+    if detail_tool is not None:
+        @tool(TOOL_CONTRACT_DETAIL)
+        def contract_detail(ref: str) -> str:
+            """Drill into ONE contract by its reference number (e.g. "CCA-2024-001").
+            Returns a readable summary of that contract's fields: counterparty,
+            type, status, department, amount, dates, risk score/severity/signals,
+            and a text snippet. Use when the user names a specific contract or asks
+            about one ref in detail.
+
+            Args:
+                ref: the contract reference number to look up.
+            """
+            return detail_tool(ref)
+
+        tools.append(contract_detail)
+
+    if compare_tool is not None:
+        @tool(TOOL_CONTRACTS_COMPARE)
+        def contracts_compare(refs: List[str]) -> str:
+            """Compare two or more contracts side-by-side across the standard fields
+            (counterparty, type, status, department, amount, dates, risk score and
+            severity) in one aligned table. Use for 'compare X and Y', 'difference
+            between X vs Y', 'X versus Y'. If the user gives names/departments
+            rather than reference numbers, first call contracts_where to resolve
+            each ref_no, then call this with the resolved refs.
+
+            Args:
+                refs: list of two or more contract reference numbers.
+            """
+            return compare_tool(refs)
+
+        tools.append(contracts_compare)
 
     # Candidate 2: no separate risk_search tool. Risk/compliance screening is
     # handled by the unified contract_search tool (the service extracts risk
@@ -636,14 +673,16 @@ class LangChainAgent(AgentCore):
         api_base: Optional[str] = None,
         model: Optional[str] = None,
         aggregate_tool: Optional[Callable[..., str]] = None,
+        detail_tool: Optional[Callable[[str], str]] = None,
+        compare_tool: Optional[Callable[..., str]] = None,
         profile: Any = None,
         hindsight_bank: Optional[str] = None,
     ):
-        # Shared orchestration state (Candidate 1): contract_tool, where_tool,
-        # aggregate_tool, profile, hindsight_bank, clarification, steps live on
-        # AgentCore.
+        # Shared orchestration state (Candidate 1): the tools, profile,
+        # hindsight_bank, clarification, steps live on AgentCore.
         super().__init__(contract_tool=contract_tool, where_tool=where_tool,
-                         aggregate_tool=aggregate_tool,
+                         aggregate_tool=aggregate_tool, detail_tool=detail_tool,
+                         compare_tool=compare_tool,
                          profile=profile, hindsight_bank=hindsight_bank)
         # Candidate 2: risk queries route to the unified contract_search tool;
         # risk scoring/ranking happens inside the search service. The risk_tool
@@ -655,7 +694,8 @@ class LangChainAgent(AgentCore):
         self._synthesize = synthesize or self._default_synthesize
         self._tools = build_langchain_tools(
             self.contract_tool, where_tool=where_tool,
-            aggregate_tool=aggregate_tool)
+            aggregate_tool=aggregate_tool, detail_tool=detail_tool,
+            compare_tool=compare_tool)
         self._tool_map = {t.name: t for t in self._tools}
         # LangGraph ReAct agent (lazy-initialized)
         self._react_agent: Optional[Any] = None

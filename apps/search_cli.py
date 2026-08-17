@@ -411,6 +411,43 @@ def build_aggregate_tool(embeddings=None, searcher=None, service=None):
     return contracts_aggregate
 
 
+def build_detail_tool(embeddings=None, searcher=None, service=None):
+    """Build the contract_detail tool (single-contract drill-down).
+
+    Returns a readable field summary string for one contract reference; the
+    contract's chunks are merged so no field is lost to chunking. No result
+    stash — the output is the summary text itself.
+    """
+    if service is None:
+        if searcher is not None:
+            service = ContractSearchService(searcher=searcher)
+        else:
+            service = ContractSearchService(embeddings=embeddings)
+
+    def contract_detail(ref):
+        return service.contract_detail(ref)
+
+    return contract_detail
+
+
+def build_compare_tool(embeddings=None, searcher=None, service=None):
+    """Build the contracts_compare tool (side-by-side comparison across refs).
+
+    Returns an aligned text table comparing the given contract references field
+    by field. No result stash — the output is the comparison table itself.
+    """
+    if service is None:
+        if searcher is not None:
+            service = ContractSearchService(searcher=searcher)
+        else:
+            service = ContractSearchService(embeddings=embeddings)
+
+    def contracts_compare(refs):
+        return service.contracts_compare(refs)
+
+    return contracts_compare
+
+
 def _load_full_sections(searcher):
     """Load all sections from the index DB as a DataFrame with decoded labels."""
     import json

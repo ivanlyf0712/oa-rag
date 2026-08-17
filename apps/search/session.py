@@ -19,7 +19,7 @@ from apps.search.memory import Memory
 
 
 def build_agent(contract_tool, where_tool, memory: Memory,
-                aggregate_tool=None,
+                aggregate_tool=None, detail_tool=None, compare_tool=None,
                 *, notify: Optional[Callable[[str], None]] = None,
                 api_key: Optional[str] = None):
     """Build the tool-calling agent over the existing pipelines.
@@ -60,5 +60,6 @@ def build_agent(contract_tool, where_tool, memory: Memory,
                                profile=profile, hindsight_bank=bank or None)
 
     return LangChainAgent(contract_tool=contract_tool, where_tool=where_tool,
-                          aggregate_tool=aggregate_tool, llm=llm,
+                          aggregate_tool=aggregate_tool, detail_tool=detail_tool,
+                          compare_tool=compare_tool, llm=llm,
                           profile=profile, hindsight_bank=bank or None)

@@ -368,6 +368,55 @@ def test_rank_by_amount_sorts_descending():
     assert amounts == sorted(amounts, reverse=True)
     assert amounts[0] == 6_000_000  # CCA001 highest
 
+
+# ── contract_detail: single-contract drill-down ──────────────────
+
+def test_contract_detail_merges_chunks_and_formats():
+    svc, _ = _service()
+    out = svc.contract_detail("CCA001")
+    assert "CCA001" in out
+    assert "IT" in out                 # department
+    assert "active" in out.lower()     # status
+    assert "HK$6.0M" in out or "6000000" in out  # amount (deduped, not 12M)
+    # risk decoded from decoded_fields -> non-zero for CCA001
+    assert "risk" in out.lower()
+
+
+def test_contract_detail_case_insensitive_and_unknown():
+    svc, _ = _service()
+    assert "CCA002" in svc.contract_detail("cca002")  # case-insensitive
+    out = svc.contract_detail("NOPE999")
+    assert "no contract" in out.lower() or "not found" in out.lower()
+
+
+# ── contracts_compare: side-by-side across refs ──────────────────
+
+def test_contracts_compare_two_refs_side_by_side():
+    svc, _ = _service()
+    out = svc.contracts_compare(["CCA001", "CCA002"])
+    low = out.lower()
+    assert "field" in low            # header column
+    assert "CCA001" in out and "CCA002" in out  # both columns present
+    # Field rows for the compared dimensions.
+    for field in ("department", "status", "amount", "risk"):
+        assert field in low
+    # Distinct values surface: IT vs Finance.
+    assert "IT" in out and "Finance" in out
+
+
+def test_contracts_compare_handles_unknown_ref():
+    svc, _ = _service()
+    out = svc.contracts_compare(["CCA001", "NOPE999"])
+    assert "CCA001" in out
+    assert "NOPE999" in out  # column still rendered
+    assert "not found" in out.lower()  # unknown ref marked in its column
+
+
+def test_contracts_compare_requires_at_least_two_refs():
+    svc, _ = _service()
+    out = svc.contracts_compare(["CCA001"])
+    assert "two" in out.lower() or "2" in out
+
     out = svc.aggregate("median", "department", "")
     assert isinstance(out, str)
     assert "unsupported" in out.lower() or "unknown" in out.lower()

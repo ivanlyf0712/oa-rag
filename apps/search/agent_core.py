@@ -56,6 +56,8 @@ class AgentCore:
         contract_tool: Optional[Callable[[str, Dict[str, str]], str]] = None,
         where_tool: Optional[Callable[[str], str]] = None,
         aggregate_tool: Optional[Callable[..., str]] = None,
+        detail_tool: Optional[Callable[[str], str]] = None,
+        compare_tool: Optional[Callable[..., str]] = None,
         profile: Any = None,
         hindsight_bank: Optional[str] = None,
         clarification: str = DEFAULT_CLARIFICATION,
@@ -64,6 +66,8 @@ class AgentCore:
         self.where_tool = where_tool
         self._has_where_tool = where_tool is not None
         self.aggregate_tool = aggregate_tool
+        self.detail_tool = detail_tool
+        self.compare_tool = compare_tool
         self.profile = profile
         # Hindsight 记忆银行 ID; None/空 → 不做跨会话记忆 recall
         self.hindsight_bank = hindsight_bank or os.getenv("HINDSIGHT_BANK_ID") or None

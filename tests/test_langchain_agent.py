@@ -358,3 +358,50 @@ def test_aggregate_tool_invoked_with_three_args():
     assert agg.func(metric="sum_amount", group_by="department", condition="over 5m") == "TABLE"
     assert seen["args"] == ("sum_amount", "department", "over 5m")
 
+
+def test_build_tools_includes_detail_and_compare_when_provided():
+    built = build_langchain_tools(
+        contract_tool=lambda q, filters=None: "C",
+        where_tool=lambda c: "W",
+        aggregate_tool=lambda metric, group_by="", condition="": "A",
+        detail_tool=lambda ref: "D",
+        compare_tool=lambda refs: "CMP",
+    )
+    names = _tool_names(built)
+    assert "contract_detail" in names
+    assert "contracts_compare" in names
+
+
+def test_build_tools_omits_detail_and_compare_when_not_provided():
+    built = build_langchain_tools(
+        contract_tool=lambda q, filters=None: "C",
+        where_tool=lambda c: "W",
+    )
+    names = _tool_names(built)
+    assert "contract_detail" not in names
+    assert "contracts_compare" not in names
+
+
+def test_detail_and_compare_tools_forward_args():
+    seen = {}
+
+    def detail(ref):
+        seen["ref"] = ref
+        return "DETAIL"
+
+    def compare(refs):
+        seen["refs"] = refs
+        return "COMPARE"
+
+    built = build_langchain_tools(
+        contract_tool=lambda q, filters=None: "C",
+        where_tool=lambda c: "W",
+        detail_tool=detail,
+        compare_tool=compare,
+    )
+    tm = {getattr(t, "name", ""): t for t in built}
+    assert tm["contract_detail"].func(ref="CCA001") == "DETAIL"
+    assert seen["ref"] == "CCA001"
+    assert tm["contracts_compare"].func(refs=["CCA001", "CCA002"]) == "COMPARE"
+    assert seen["refs"] == ["CCA001", "CCA002"]
+

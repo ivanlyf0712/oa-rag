@@ -65,6 +65,12 @@ _AGG_TITLES = {
     "avg_amount": "Average contract amount",
 }
 
+# Fields shown per column in contracts_compare (row order preserved).
+_COMPARE_FIELDS = (
+    "counterparty", "contract_type", "status", "department", "amount",
+    "start_date", "end_date", "risk_score", "risk_severity",
+)
+
 
 def _fmt_amount(value: Any) -> str:
     """Render a numeric amount compactly, e.g. 8500000 -> HK$8.5M."""
@@ -488,6 +494,146 @@ class ContractSearchService:
             lines.append("%s | %s" % (k.ljust(width), rendered))
         if overflow > 0:
             lines.append("+%d more groups not shown" % overflow)
+        return "\n".join(lines)
+
+    def _contract_detail_meta(self, ref: str) -> Optional[Tuple[Dict[str, Any], str]]:
+        """Merge every chunk of one contract into a single metadata record.
+
+        Returns (merged_meta, snippet) or None when the ref is unknown. For each
+        field the "richest" value across chunks wins (a populated, longer value
+        beats an empty/short one), so a field blank in chunk 0 but set in chunk 1
+        is still surfaced. Risk scoring runs on the merged record. Never raises.
+        """
+        ref = (ref or "").strip().upper()
+        if not ref:
+            return None
+        db = getattr(getattr(self._searcher, "embeddings", None), "database", None)
+        if db is None:
+            return None
+        conn = db.connection
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT id, text, tags FROM sections")
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.warning("contract_detail scan failed (%s)", e)
+            return None
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+        merged: Dict[str, Any] = {}
+        snippet = ""
+        found = False
+        for row in rows:
+            doc_id, text, tags_json = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, row[-1] if row else None)
+            if tags_json is None:
+                continue
+            meta = _parse_tags(tags_json)
+            if str(meta.get("ref_no") or meta.get("contract_id") or "").strip().upper() != ref:
+                continue
+            found = True
+            if not snippet and text:
+                snippet = _clean_text_from_enriched(text)
+            for k, v in meta.items():
+                cur_v = merged.get(k)
+                if cur_v in (None, "") and v not in (None, ""):
+                    merged[k] = v
+                elif isinstance(v, str) and isinstance(cur_v, str) and len(v) > len(cur_v):
+                    merged[k] = v
+                elif k == "decoded_fields" and isinstance(v, dict):
+                    existing = merged.get(k) if isinstance(merged.get(k), dict) else {}
+                    merged[k] = {**existing, **v}
+        if not found:
+            return None
+
+        row = {"id": ref, "text": "", "metadata": merged}
+        self._score_rows([row])  # attaches risk_score/severity/signals onto merged
+        return merged, snippet
+
+    def contract_detail(self, ref: str) -> str:
+        """Single-contract drill-down: a readable field summary for one ref."""
+        result = self._contract_detail_meta(ref)
+        if result is None:
+            return "No contract found for reference %r." % (ref or "")
+        meta, snippet = result
+
+        def _g(*keys):
+            for k in keys:
+                v = meta.get(k)
+                if v not in (None, ""):
+                    return _fmt_amount(v) if k == "amount" else str(v)
+                if k == "amount_label" and meta.get("amount") not in (None, ""):
+                    return _fmt_amount(meta.get("amount"))
+            return "-"
+
+        title = meta.get("title") or meta.get("counterparty_name") or ""
+        lines = ["Contract detail: %s%s" % (meta.get("ref_no") or ref, (" — " + title) if title else "")]
+        lines.append("Counterparty: %s" % _g("counterparty_name", "title"))
+        lines.append("Type: %s" % _g("contract_type_label", "contract_type"))
+        lines.append("Status: %s" % _g("status_label", "status"))
+        lines.append("Department: %s" % _g("department"))
+        lines.append("Amount: %s" % _g("amount_label", "amount"))
+        lines.append("Start: %s" % _g("contract_start_date", "requested_date"))
+        lines.append("End: %s" % _g("contract_end_date"))
+        score = meta.get("risk_score")
+        severity = meta.get("risk_severity") or "low"
+        signals = meta.get("matched_signals") or []
+        lines.append("Risk: %s (%s)" % (score if score is not None else 0, severity))
+        if signals:
+            lines.append("Signals: %s" % "; ".join(str(s) for s in signals[:5]))
+        if snippet:
+            lines.append("Snippet: %s" % snippet[:200])
+        return "\n".join(lines)
+
+    def contracts_compare(self, refs: List[str]) -> str:
+        """Side-by-side field comparison across 2+ contracts (aligned table)."""
+        refs = [str(r).strip() for r in (refs or []) if str(r or "").strip()]
+        if len(refs) < 2:
+            return ("contracts_compare needs at least two contract references; "
+                    "got %d." % len(refs))
+
+        cells: List[Dict[str, str]] = []
+        for r in refs:
+            result = self._contract_detail_meta(r)
+            if result is None:
+                cells.append({f: "(not found)" for f in _COMPARE_FIELDS})
+                continue
+            meta, _snippet = result
+
+            def _g(*keys, _m=meta):
+                for k in keys:
+                    v = _m.get(k)
+                    if v not in (None, ""):
+                        return _fmt_amount(v) if k == "amount" else str(v)
+                    if k == "amount_label" and _m.get("amount") not in (None, ""):
+                        return _fmt_amount(_m.get("amount"))
+                return "-"
+
+            cells.append({
+                "counterparty": _g("counterparty_name", "title"),
+                "contract_type": _g("contract_type_label", "contract_type"),
+                "status": _g("status_label", "status"),
+                "department": _g("department"),
+                "amount": _g("amount_label", "amount"),
+                "start_date": _g("contract_start_date", "requested_date"),
+                "end_date": _g("contract_end_date"),
+                "risk_score": str(meta.get("risk_score") if meta.get("risk_score") is not None else 0),
+                "risk_severity": str(meta.get("risk_severity") or "low"),
+            })
+
+        label_w = max(len(f) for f in _COMPARE_FIELDS)
+        col_w = [max([len(refs[i])] + [len(cells[i][f]) for f in _COMPARE_FIELDS])
+                 for i in range(len(refs))]
+        header = "%s | %s" % ("field".ljust(label_w),
+                              " | ".join(refs[i].ljust(col_w[i]) for i in range(len(refs))))
+        sep = "%s-+-%s" % ("-" * label_w, "-+-".join("-" * w for w in col_w))
+        lines = ["Contract comparison (%d):" % len(refs), header, sep]
+        for f in _COMPARE_FIELDS:
+            lines.append("%s | %s" % (f.ljust(label_w),
+                                      " | ".join(cells[i][f].ljust(col_w[i]) for i in range(len(refs)))))
         return "\n".join(lines)
 
     def _run_sections_sql(self, sql: str) -> Optional[List[Tuple[Any, str, Dict[str, Any]]]]:

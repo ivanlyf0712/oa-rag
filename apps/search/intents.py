@@ -30,6 +30,8 @@ TOOL_CONTRACT_SEARCH = "contract_search"
 TOOL_RISK_SEARCH = "risk_search"
 TOOL_CONTRACTS_WHERE = "contracts_where"
 TOOL_CONTRACTS_AGGREGATE = "contracts_aggregate"
+TOOL_CONTRACT_DETAIL = "contract_detail"
+TOOL_CONTRACTS_COMPARE = "contracts_compare"
 TOOL_NONE = "none"
 
 # Risk is computed inside the unified contract_search pipeline (the service
