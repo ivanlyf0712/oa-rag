@@ -19,6 +19,7 @@ from apps.search.memory import Memory
 
 
 def build_agent(contract_tool, where_tool, memory: Memory,
+                aggregate_tool=None,
                 *, notify: Optional[Callable[[str], None]] = None,
                 api_key: Optional[str] = None):
     """Build the tool-calling agent over the existing pipelines.
@@ -58,5 +59,6 @@ def build_agent(contract_tool, where_tool, memory: Memory,
         return CrossTableAgent(contract_tool=contract_tool, where_tool=where_tool,
                                profile=profile, hindsight_bank=bank or None)
 
-    return LangChainAgent(contract_tool=contract_tool, where_tool=where_tool, llm=llm,
+    return LangChainAgent(contract_tool=contract_tool, where_tool=where_tool,
+                          aggregate_tool=aggregate_tool, llm=llm,
                           profile=profile, hindsight_bank=bank or None)

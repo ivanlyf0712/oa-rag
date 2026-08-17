@@ -27,7 +27,7 @@ import pandas as pd
 from apps.search._core import Searcher, _clean_text_from_enriched
 
 from apps.search.status_labels import normalize_status as _sl_normalize_status
-from apps.search.where_sql import condition_to_sql
+from apps.search.where_sql import aggregate_sql, condition_to_sql
 from apps.risk_search import (
     MODE_RISKY,
     RISK_FILTER_FIELDS,
@@ -54,7 +54,37 @@ OBSERVATION_ROW_BUDGET = 50
 
 RANK_RELEVANCE = "relevance"
 RANK_RISK = "risk"
-VALID_RANKS = (RANK_RELEVANCE, RANK_RISK)
+RANK_AMOUNT = "amount"
+VALID_RANKS = (RANK_RELEVANCE, RANK_RISK, RANK_AMOUNT)
+
+# Aggregate rendering: cap on groups shown and human-readable metric titles.
+MAX_AGG_GROUPS = 50
+_AGG_TITLES = {
+    "count": "Contract count",
+    "sum_amount": "Total contract amount",
+    "avg_amount": "Average contract amount",
+}
+
+
+def _fmt_amount(value: Any) -> str:
+    """Render a numeric amount compactly, e.g. 8500000 -> HK$8.5M."""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if n >= 1_000_000:
+        return "HK$%.1fM" % (n / 1_000_000)
+    if n >= 1_000:
+        return "HK$%.0fK" % (n / 1_000)
+    return "HK$%.0f" % n
+
+
+def _fmt_count(value: Any) -> str:
+    """Render a count/number as a plain integer string."""
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        return "-"
 
 # "list all"-style queries have no semantic content: they enumerate.
 _ENUMERATION_RE = re.compile(
@@ -345,6 +375,7 @@ class ContractSearchService:
         limit: Optional[int] = None,
         llm_client: Any = None,
         allow_llm: bool = True,
+        rank_by: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Exact structured retrieval: natural-language condition -> SQL.
 
@@ -358,6 +389,7 @@ class ContractSearchService:
         """
         cond = (condition or "").strip()
         self.last_plan = None
+        rank_by = rank_by if rank_by in VALID_RANKS else RANK_RELEVANCE
 
         sql = None
         if cond:
@@ -368,14 +400,14 @@ class ContractSearchService:
         if sql is None:
             # Untranslatable condition -> index-scan fallback (semantic).
             logger.info("contracts_where fallback to semantic scan: %r", cond)
-            return self._finalize(self._semantic_search(cond, {}), RANK_RELEVANCE, limit)
+            return self._finalize(self._semantic_search(cond, {}), rank_by, limit)
 
         section_rows = self._run_sections_sql(sql)
         if section_rows is None:
             # SQL execution failed -> index-scan fallback; never raise.
             logger.warning("contracts_where SQL failed; semantic fallback: %r", cond)
             if cond:
-                return self._finalize(self._semantic_search(cond, {}), RANK_RELEVANCE, limit)
+                return self._finalize(self._semantic_search(cond, {}), rank_by, limit)
             return []
 
         seen: Dict[str, Dict[str, Any]] = {}
@@ -392,7 +424,71 @@ class ContractSearchService:
             }
             order.append(key)
         rows = [seen[k] for k in order]
-        return self._finalize(rows, RANK_RELEVANCE, limit)
+        return self._finalize(rows, rank_by, limit)
+
+    def aggregate(
+        self,
+        metric: str,
+        group_by: str = "",
+        condition: str = "",
+    ) -> str:
+        """SQL-side aggregate over the sections table, rendered as a text table.
+
+        The database computes the aggregate over the FULL matching set (never a
+        LIMIT-capped row fetch), so totals are correct. metric/group_by are
+        whitelisted in where_sql.aggregate_sql; unknown values or a missing DB
+        yield a human-readable message (never an exception to the agent).
+        """
+        sql = aggregate_sql(metric, group_by, condition)
+        if sql is None:
+            return ("Unsupported aggregate: metric=%r group_by=%r. Supported "
+                    "metrics: count, sum_amount, avg_amount; groups: department, "
+                    "counterparty_name, contract_type, status_label, year."
+                    % (metric, group_by))
+
+        db = getattr(getattr(self._searcher, "embeddings", None), "database", None)
+        if db is None:
+            return "Aggregate unavailable: no sections database connection."
+        conn = db.connection
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            fetched = cur.fetchall()
+        except Exception as e:
+            logger.warning("aggregate SQL failed (%s): %s", e, sql)
+            return "Aggregate query failed; please rephrase."
+
+        is_amount = (metric or "").strip().lower() in ("sum_amount", "avg_amount")
+        label = _AGG_TITLES.get((metric or "").strip().lower(), "Value")
+
+        if not group_by:
+            # Single overall figure (no GROUP BY): one row, value in col 0.
+            value = fetched[0][0] if fetched and fetched[0] else None
+            rendered = _fmt_amount(value) if is_amount else _fmt_count(value)
+            return "%s overall: %s" % (label, rendered)
+
+        groups = [(str(k) if k not in (None, "") else "(unknown)", v)
+                  for k, v in fetched]
+        if not groups:
+            return "No matching contracts."
+
+        total_groups = len(groups)
+        shown = groups[:MAX_AGG_GROUPS]
+        overflow = total_groups - len(shown)
+
+        key_head = group_by or "group"
+        val_head = {"count": "count", "sum_amount": "total_amount",
+                    "avg_amount": "avg_amount"}.get(metric, "value")
+        width = max([len(key_head)] + [len(k) for k, _ in shown])
+        lines = ["%s by %s (%d groups):" % (label, group_by, total_groups),
+                 "%s | %s" % (key_head.ljust(width), val_head),
+                 "%s-+-%s" % ("-" * width, "-" * len(val_head))]
+        for k, v in shown:
+            rendered = _fmt_amount(v) if is_amount else _fmt_count(v)
+            lines.append("%s | %s" % (k.ljust(width), rendered))
+        if overflow > 0:
+            lines.append("+%d more groups not shown" % overflow)
+        return "\n".join(lines)
 
     def _run_sections_sql(self, sql: str) -> Optional[List[Tuple[Any, str, Dict[str, Any]]]]:
         """Execute a validated read-only SELECT on the sections table.
@@ -437,6 +533,11 @@ class ContractSearchService:
             rows = sorted(
                 rows,
                 key=lambda r: -((r.get("metadata") or {}).get("risk_score") or 0),
+            )
+        elif rank_by == RANK_AMOUNT:
+            rows = sorted(
+                rows,
+                key=lambda r: -((r.get("metadata") or {}).get("amount") or 0),
             )
         if limit is not None:
             rows = rows[:limit]

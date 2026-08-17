@@ -58,6 +58,7 @@ from apps.search.intents import (
     INTENT_RISK,
     INTENT_TO_TOOL,
     TOOL_CONTRACT_SEARCH,
+    TOOL_CONTRACTS_AGGREGATE,
     TOOL_CONTRACTS_WHERE,
     TOOL_NONE,
     default_decision,
@@ -138,6 +139,12 @@ class _ContractFiltersSchema(BaseModel):
     date_to: str = Field(default="", description="Latest contract end date (YYYY-MM-DD)")
     expired: bool = Field(default=False, description="Whether to filter to expired contracts only")
     contract_id: str = Field(default="", description="Contract reference number to filter by")
+    rank_by: str = Field(
+        default="",
+        description="Result ordering: \"relevance\" (default), \"risk\" (highest risk "
+                    "score first), or \"amount\" (largest contract value first — use "
+                    "for 'largest/biggest/most expensive contracts')."
+    )
     # Pre-built filters dict (legacy / scripted callers). Merged with the
     # individual fields above; individual fields win when both are present.
     filters: Optional[Dict[str, Any]] = Field(
@@ -179,6 +186,7 @@ def _looks_analytical(query: str) -> bool:
 def build_langchain_tools(
     contract_tool: ContractTool,
     where_tool: Optional[Callable[[str], str]] = None,
+    aggregate_tool: Optional[Callable[..., str]] = None,
 ) -> List[Any]:
     """Wrap the raw callables as LangChain @tool objects.
 
@@ -202,6 +210,7 @@ def build_langchain_tools(
                         date_to: str = "",
                         expired: bool = False,
                         contract_id: str = "",
+                        rank_by: str = "",
                         ) -> str:
         """Search the contract corpus semantically (hybrid keyword/vector).
 
@@ -212,7 +221,8 @@ def build_langchain_tools(
 
         Filter fields (all optional; omit when the user did not specify):
         contract_type, status, counterparty_name, department, date_from,
-        date_to, expired, contract_id.
+        date_to, expired, contract_id. Set rank_by to "risk" or "amount" to
+        reorder results (e.g. rank_by="amount" for the largest contracts).
         """
         merged = dict(filters or {})
         for key, val in [("contract_type", contract_type),
@@ -227,6 +237,10 @@ def build_langchain_tools(
                 # When the LLM passes the value via the individual kwarg
                 # (from the Pydantic args_schema), prefer it over the dict.
                 merged.setdefault(key, val)
+        # Pass rank_by only when set so legacy 2-arg contract_tool callables
+        # (older builds, scripted fakes) keep working without a rank_by param.
+        if rank_by:
+            return contract_tool(query, merged, rank_by=rank_by)
         return contract_tool(query, merged)
 
     tools = [contract_search]
@@ -251,6 +265,28 @@ def build_langchain_tools(
             return where_tool(condition)
 
         tools.append(contracts_where)
+
+    if aggregate_tool is not None:
+        @tool(TOOL_CONTRACTS_AGGREGATE)
+        def contracts_aggregate(metric: str, group_by: str = "", condition: str = "") -> str:
+            """Aggregate the contract corpus with SQL-side accuracy over the FULL
+            matching set (never a LIMIT-capped sample). Use for counts, totals,
+            averages, or breakdowns by a field — questions like 'how many
+            contracts per department', 'total value by counterparty', 'average
+            contract size', 'how many active contracts'.
+
+            Args:
+                metric: one of "count" (number of contracts), "sum_amount"
+                    (total value), or "avg_amount" (average value).
+                group_by: optional breakdown field — "department",
+                    "counterparty_name", "contract_type", "status_label", or
+                    "year". Omit for a single overall figure.
+                condition: optional natural-language filter, e.g. "over 5m",
+                    "active contracts", "risk not accepted". Omit for all contracts.
+            """
+            return aggregate_tool(metric, group_by, condition)
+
+        tools.append(contracts_aggregate)
 
     # Candidate 2: no separate risk_search tool. Risk/compliance screening is
     # handled by the unified contract_search tool (the service extracts risk
@@ -599,12 +635,15 @@ class LangChainAgent(AgentCore):
         synthesize: Optional[Callable[[str, str, str], str]] = None,
         api_base: Optional[str] = None,
         model: Optional[str] = None,
+        aggregate_tool: Optional[Callable[..., str]] = None,
         profile: Any = None,
         hindsight_bank: Optional[str] = None,
     ):
         # Shared orchestration state (Candidate 1): contract_tool, where_tool,
-        # profile, hindsight_bank, clarification, steps live on AgentCore.
+        # aggregate_tool, profile, hindsight_bank, clarification, steps live on
+        # AgentCore.
         super().__init__(contract_tool=contract_tool, where_tool=where_tool,
+                         aggregate_tool=aggregate_tool,
                          profile=profile, hindsight_bank=hindsight_bank)
         # Candidate 2: risk queries route to the unified contract_search tool;
         # risk scoring/ranking happens inside the search service. The risk_tool
@@ -615,7 +654,8 @@ class LangChainAgent(AgentCore):
         self.router = router or SearchRouter(api_base=api_base, model=model or LITELLM_MODEL)
         self._synthesize = synthesize or self._default_synthesize
         self._tools = build_langchain_tools(
-            self.contract_tool, where_tool=where_tool)
+            self.contract_tool, where_tool=where_tool,
+            aggregate_tool=aggregate_tool)
         self._tool_map = {t.name: t for t in self._tools}
         # LangGraph ReAct agent (lazy-initialized)
         self._react_agent: Optional[Any] = None

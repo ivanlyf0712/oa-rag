@@ -300,3 +300,61 @@ def test_default_synthesize_falls_back_gracefully_when_llm_down(tools):
 def test_default_synthesize_empty_observation():
     a = LangChainAgent()
     assert a._default_synthesize("q", TOOL_CONTRACT_SEARCH, "   ") == "No matching contracts were found."
+
+
+# ── build_langchain_tools wiring: aggregate tool + rank_by ───────
+
+def _tool_names(built):
+    return {getattr(t, "name", "") for t in built}
+
+
+def test_build_tools_includes_aggregate_when_provided():
+    built = build_langchain_tools(
+        contract_tool=lambda q, filters=None, rank_by=None: "C",
+        where_tool=lambda c: "W",
+        aggregate_tool=lambda metric, group_by="", condition="": "A",
+    )
+    assert "contracts_aggregate" in _tool_names(built)
+    assert "contract_search" in _tool_names(built)
+    assert "contracts_where" in _tool_names(built)
+
+
+def test_build_tools_omits_aggregate_when_not_provided():
+    built = build_langchain_tools(
+        contract_tool=lambda q, filters=None, rank_by=None: "C",
+        where_tool=lambda c: "W",
+    )
+    assert "contracts_aggregate" not in _tool_names(built)
+
+
+def test_contract_search_forwards_rank_by():
+    seen = {}
+
+    def contract(query, filters=None, rank_by=None):
+        seen["rank_by"] = rank_by
+        return "OK"
+
+    built = build_langchain_tools(contract_tool=contract, where_tool=lambda c: "W")
+    cs = next(t for t in built if getattr(t, "name", "") == "contract_search")
+    cs.func(query="big contracts", rank_by="amount")
+    assert seen["rank_by"] == "amount"
+    cs.func(query="big contracts")  # rank_by omitted -> None
+    assert seen["rank_by"] is None
+
+
+def test_aggregate_tool_invoked_with_three_args():
+    seen = {}
+
+    def aggregate(metric, group_by="", condition=""):
+        seen["args"] = (metric, group_by, condition)
+        return "TABLE"
+
+    built = build_langchain_tools(
+        contract_tool=lambda q, filters=None, rank_by=None: "C",
+        where_tool=lambda c: "W",
+        aggregate_tool=aggregate,
+    )
+    agg = next(t for t in built if getattr(t, "name", "") == "contracts_aggregate")
+    assert agg.func(metric="sum_amount", group_by="department", condition="over 5m") == "TABLE"
+    assert seen["args"] == ("sum_amount", "department", "over 5m")
+

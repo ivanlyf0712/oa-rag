@@ -44,7 +44,7 @@ from apps.search.agent_config import (PRESET_LABELS, STYLE_LABELS, apply_preset,
 from apps.search.persona import DispositionProfile
 from apps.search.memory import Memory
 from apps.search.session import build_agent as _build_search_agent
-from apps.search_cli import build_contract_tool, build_where_tool
+from apps.search_cli import build_aggregate_tool, build_contract_tool, build_where_tool
 try:
     from apps.search.langchain_agent import check_llm_health as _check_llm_health_uncached
 except Exception:  # pragma: no cover - defensive: never crash the UI on import
@@ -140,8 +140,9 @@ def _build_agent(index_path: str, embeddings):
     """
     contract_tool = build_contract_tool(embeddings)
     where_tool = build_where_tool(embeddings)
+    aggregate_tool = build_aggregate_tool(embeddings)
     return _build_search_agent(
-        contract_tool, where_tool, _memory(), notify=st.caption)
+        contract_tool, where_tool, _memory(), aggregate_tool, notify=st.caption)
 
 
 def _get_summary_llm():

@@ -276,3 +276,106 @@ def test_cross_table_agent_routes_enumeration_to_where():
     assert result["tool"] == "contracts_where"
     assert seen == ["list all contracts with risk not accepted"]
     assert result["success"] is True
+
+# ── contracts_aggregate: SQL builder (whitelist, validated) ──────
+from apps.search.where_sql import aggregate_sql
+
+
+def test_aggregate_sql_count_by_department():
+    sql = aggregate_sql("count", "department", "")
+    assert sql is not None
+    low = sql.lower()
+    assert low.startswith("select")
+    assert "count(*)" in low
+    assert "json_extract(tags, '$.department')" in low
+    assert "group by" in low
+    assert _validate_sql(sql) is not None
+
+
+def test_aggregate_sql_sum_amount_no_group():
+    sql = aggregate_sql("sum_amount", "", "")
+    assert sql is not None
+    low = sql.lower()
+    # Dedupe subquery: per-contract amount via MAX over the chunk group.
+    assert "max(cast(json_extract(tags, '$.amount') as real))" in low
+    assert "sum(amount)" in low
+    # No outer GROUP BY (single overall figure); inner dedupe groups by ck.
+    assert "group by ck" in low
+    assert "group by grp" not in low
+
+
+def test_aggregate_sql_avg_amount_by_year():
+    sql = aggregate_sql("avg_amount", "year", "")
+    assert sql is not None
+    low = sql.lower()
+    assert "avg(amount)" in low  # outer aggregate over deduped per-contract rows
+    assert "strftime('%Y'" in sql  # 4-digit year group expression
+    assert "group by grp" in low
+
+
+def test_aggregate_sql_injects_translated_condition():
+    # "over 5m" is a threshold-flag rule -> Over5M label WHERE clause injected.
+    sql = aggregate_sql("count", "department", "contracts over 5m")
+    assert sql is not None
+    low = sql.lower()
+    assert "where" in low
+    assert "over5m" in low  # threshold flag, not a raw $.amount comparison
+    assert "group by" in low
+    assert _validate_sql(sql) is not None
+
+
+def test_aggregate_sql_rejects_unknown_metric_and_group():
+    assert aggregate_sql("median", "department", "") is None
+    assert aggregate_sql("count", "salary", "") is None
+    assert aggregate_sql("count'; DROP TABLE sections; --", "department", "") is None
+
+
+
+# ── service.aggregate: execution + rendering ─────────────────────
+
+def test_aggregate_count_by_department():
+    svc, _ = _service()
+    out = svc.aggregate("count", "department", "")
+    # 3 distinct departments, one row each (CCA001/2/3).
+    assert "IT" in out and "Finance" in out and "Legal" in out
+    assert out.count("\n") >= 3  # header + at least 3 group rows
+    # Each department has exactly 1 contract.
+    assert "1" in out
+
+
+def test_aggregate_sum_amount_overall():
+    svc, _ = _service()
+    out = svc.aggregate("sum_amount", "", "")
+    # 6_000_000 + 2_000_000 + 500_000 = 8_500_000 total (no GROUP BY).
+    assert "8500000" in out or "8.5" in out or "8,500,000" in out
+
+
+def test_aggregate_sum_amount_filtered_by_condition():
+    svc, _ = _service()
+    # Only CCA001 is Over5M -> total 6_000_000.
+    out = svc.aggregate("sum_amount", "", "contracts over 5m")
+    assert "6000000" in out or "6.0" in out or "6,000,000" in out
+
+
+def test_aggregate_unknown_metric_returns_message_not_raise():
+    svc, _ = _service()
+
+def test_rank_by_amount_sorts_descending():
+    svc, _ = _service()
+    # "list all"-style structured query returns all contracts; rank by amount.
+    rows = svc.search_where("", allow_llm=False, rank_by="amount")
+    amounts = [ (r.get("metadata") or {}).get("amount") for r in rows ]
+    assert amounts == sorted(amounts, reverse=True)
+    assert amounts[0] == 6_000_000  # CCA001 highest
+
+    out = svc.aggregate("median", "department", "")
+    assert isinstance(out, str)
+    assert "unsupported" in out.lower() or "unknown" in out.lower()
+
+def test_aggregate_sql_is_read_only_single_statement():
+    sql = aggregate_sql("sum_amount", "counterparty_name", "")
+    assert sql is not None
+    assert ";" not in sql
+    for bad in ("insert", "update", "delete", "drop", "alter", "create"):
+        assert bad not in sql.lower()
+

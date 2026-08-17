@@ -220,6 +220,106 @@ def _condition_to_sql(condition: str) -> Optional[str]:
     return None
 
 
+# ── contracts_aggregate: whitelisted SQL-side aggregation ─────────
+# Aggregation is computed by the database over the FULL matching set (never a
+# LIMIT-capped row fetch summed in Python, which would silently truncate totals).
+# metric/group_by are whitelisted -> SQL expressions; the only free text is the
+# natural-language `condition`, whose WHERE fragment is reused from
+# _condition_to_sql and the whole statement re-validated by _validate_sql.
+
+_AGG_AMOUNT = "CAST(json_extract(tags, '$.amount') AS REAL)"
+
+# Whitelisted metric names (validated against this set in aggregate_sql).
+_AGG_METRICS = ("count", "sum_amount", "avg_amount")
+
+_AGG_GROUPS = {
+    "department": "json_extract(tags, '$.department')",
+    "counterparty_name": "json_extract(tags, '$.counterparty_name')",
+    "contract_type": "json_extract(tags, '$.contract_type')",
+    "status_label": "json_extract(tags, '$.status_label')",
+    "year": "strftime('%Y', date(json_extract(tags, '$.contract_end_date')))",
+}
+
+# WHERE fragment extractor: pull the text between WHERE and the trailing LIMIT
+# out of a _condition_to_sql SELECT so we can re-hang it on an aggregate.
+_WHERE_FRAG_RE = re.compile(r"\bWHERE\b(.+?)\s*LIMIT\s+\d+\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def _where_fragment(condition: str) -> Optional[str]:
+    """Translate a natural-language condition to a bare WHERE fragment.
+
+    Reuses the deterministic rule chain (_condition_to_sql); returns None when
+    no rule matches (the caller then runs the aggregate unfiltered rather than
+    invoking the LLM, keeping aggregation offline and deterministic).
+    """
+    cond = (condition or "").strip()
+    if not cond:
+        return None
+    remainder = enumeration_remainder(cond)
+    if not remainder:
+        return None
+    sql = _condition_to_sql(remainder)
+    if not sql:
+        return None
+    m = _WHERE_FRAG_RE.search(sql)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+# Contract-level identity used to collapse a contract's many chunks into one
+# row before aggregating (a contract with N chunks must not be counted/summed
+# N times). Mirrors service._contract_key: contract_id, else ref_no.
+_CONTRACT_KEY_SQL = "COALESCE(NULLIF(json_extract(tags, '$.contract_id'), ''), " \
+                    "json_extract(tags, '$.ref_no'))"
+
+
+def aggregate_sql(metric: str, group_by: str = "", condition: str = "") -> Optional[str]:
+    """Build a validated read-only aggregate SELECT, or None when unsafe/unknown.
+
+    The aggregate runs over one row per CONTRACT (chunks deduped via the
+    contract key), never over raw section chunks, so counts/sums are correct.
+    The auto-appended LIMIT bounds the number of GROUPS returned, not the rows
+    scanned — the aggregate is always computed over the full matching set.
+    """
+    metric = (metric or "").strip().lower()
+    if metric not in _AGG_METRICS:
+        return None
+    g = (group_by or "").strip().lower()
+    group_expr = None
+    if g:
+        group_expr = _AGG_GROUPS.get(g)
+        if group_expr is None:
+            return None
+
+    where = _where_fragment(condition)
+
+    # One row per contract: group chunks by the contract key, take any chunk's
+    # amount/department/etc. (consistent across a contract's chunks) via MAX().
+    inner = "SELECT %s AS ck, MAX(%s) AS amount" % (_CONTRACT_KEY_SQL, _AGG_AMOUNT)
+    if group_expr is not None:
+        inner += ", MAX(%s) AS grp" % group_expr
+    inner += " FROM sections"
+    if where:
+        inner += " WHERE %s" % where
+    inner += " GROUP BY ck"
+
+    if metric == "count":
+        outer_agg = "COUNT(*)"
+    elif metric == "sum_amount":
+        outer_agg = "SUM(amount)"
+    else:  # avg_amount
+        outer_agg = "AVG(amount)"
+
+    if group_expr is None:
+        sql = "SELECT %s AS v FROM (%s)" % (outer_agg, inner)
+    else:
+        sql = ("SELECT grp AS k, %s AS v FROM (%s) "
+               "GROUP BY grp ORDER BY v DESC" % (outer_agg, inner))
+
+    return _validate_sql(sql)
+
+
 # ── LLM text-to-SQL fallback ────────────────────────────────────────
 
 _TEXT_TO_SQL_SYSTEM = (

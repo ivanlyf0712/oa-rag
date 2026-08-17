@@ -328,13 +328,16 @@ def build_contract_tool(embeddings, searcher=None, planner=None):
     else:
         service = ContractSearchService(embeddings=embeddings, planner=planner)
 
-    def contract_tool(query, filters):
-        rows = service.search(query, filters=filters)
+    def contract_tool(query, filters, rank_by=None):
+        # An explicit rank_by from the agent (e.g. "amount" for "largest
+        # contracts") overrides the planner's rank hint; otherwise the planner's
+        # hint (or relevance) applies via the service default.
+        rows = service.search(query, filters=filters, rank_by=rank_by)
         stash_results(
             rows,
             query=query,
             filters=filters,
-            rank_by=(service.last_plan or {}).get("rank_hint") or "relevance",
+            rank_by=rank_by or (service.last_plan or {}).get("rank_hint") or "relevance",
             observation_count=min(len(rows), OBSERVATION_ROW_BUDGET),
         )
         return format_contract_observation(rows)
@@ -384,6 +387,28 @@ def build_where_tool(embeddings=None, searcher=None, service=None, llm_client=No
         return format_contract_observation(rows)
 
     return contracts_where
+
+
+def build_aggregate_tool(embeddings=None, searcher=None, service=None):
+    """Build the contracts_aggregate tool (SQL-side aggregate, spec agent_aggregate_rank_tools).
+
+    The agent passes (metric, group_by, condition); the database computes the
+    aggregate over the FULL matching contract set (per-contract deduped), so
+    totals are correct — never a LIMIT-capped row fetch summed in Python.
+    Returns a rendered text table string. Unlike contracts_where, there is no
+    row set to stash (the output IS the summary table), so nothing is added to
+    the result store.
+    """
+    if service is None:
+        if searcher is not None:
+            service = ContractSearchService(searcher=searcher)
+        else:
+            service = ContractSearchService(embeddings=embeddings)
+
+    def contracts_aggregate(metric, group_by="", condition=""):
+        return service.aggregate(metric, group_by, condition)
+
+    return contracts_aggregate
 
 
 def _load_full_sections(searcher):
