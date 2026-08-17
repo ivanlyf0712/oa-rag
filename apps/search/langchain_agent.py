@@ -64,6 +64,7 @@ from apps.search.intents import (
     default_decision,
     infer_intent_from_query,
 )
+from apps.search.synthesis import AnswerSynthesizer
 from apps.search.router import SearchRouter
 from apps.search.service import _looks_like_ref_no
 
@@ -333,13 +334,22 @@ def check_llm_health(deep: bool = False) -> Dict[str, Any]:
 
 # ── LangGraph availability ─────────────────────────────────────
 # LangGraph V1.0 moved create_react_agent to langchain.agents.create_agent;
-# fall back to the legacy langgraph.prebuilt location when needed.
+# prefer that supported location and only fall back to the legacy
+# langgraph.prebuilt symbol when the full langchain package is not installed.
+# The legacy fallback emits a LangGraphDeprecatedSinceV10 warning; we silence
+# that single known warning at the import site so it does not drown out real
+# warnings in the test suite (the fallback is still the only available symbol
+# in a langgraph-only environment).
+import warnings as _warnings
+
 try:
     from langchain.agents import create_agent as _create_react_agent
     _LANGGRAPH_AVAILABLE = True
 except ImportError:
     try:
-        from langgraph.prebuilt import create_react_agent as _create_react_agent
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")  # known legacy-path deprecation
+            from langgraph.prebuilt import create_react_agent as _create_react_agent
         _LANGGRAPH_AVAILABLE = True
     except ImportError:
         _create_react_agent = None
@@ -613,9 +623,22 @@ class LangChainAgent:
         self._on_tool_callback: Optional[Callable] = None
         # Per-request tool meta log (tool name + args in order)
         self._tool_meta_log: List[Dict[str, Any]] = []
+        # Synthesis deep module (Candidate 3), built lazily around the LLM.
+        self._synthesizer: Optional[AnswerSynthesizer] = None
 
     def _add_step(self, icon: str, label: str, detail: str = "") -> None:
         self._steps.append({"icon": icon, "label": label, "detail": detail})
+
+    def _get_synthesizer(self) -> AnswerSynthesizer:
+        """Return the shared AnswerSynthesizer, rebuilding if the LLM changed.
+
+        The LLM is resolved lazily (it may be unavailable on first use), so the
+        synthesizer is rebuilt whenever the resolved LLM object changes.
+        """
+        llm = self._get_llm()
+        if self._synthesizer is None or self._synthesizer._llm is not llm:
+            self._synthesizer = AnswerSynthesizer(llm=llm)
+        return self._synthesizer
 
     def _get_llm(self) -> Optional[Any]:
         """Return the shared chat model (_LiteLLMWrapper), or None when unavailable.
@@ -648,64 +671,19 @@ class LangChainAgent:
         }
 
     def _default_synthesize(self, query: str, tool: str, observation: str) -> str:
-        """Produce a concise overall summary of the retrieved evidence via the LLM.
+        """Produce a concise overall summary of the retrieved evidence.
 
-        The model summarizes the result set at a high level instead of echoing
-        raw snippets, ids, or encoded fields. When no LLM is available, return a
-        plain human-readable fallback (never the raw prompt or raw evidence).
+        The synthesis policy (prompt wording, LLM plumbing, deterministic
+        no-LLM fallback) lives in the shared ``apps.search.synthesis`` deep
+        module (Candidate 3); this method only resolves the LLM and delegates
+        so the seam stays stable for existing callers/tests.
         """
-        if not observation or not observation.strip():
-            return "No matching contracts were found."
-
-        NL = chr(10)
-        # The observation is already budget-capped by the observation
-        # formatter (OBSERVATION_ROW_BUDGET rows + overflow marker), so it
-        # goes to the prompt untruncated. The full result set is rendered in
-        # the UI via the result store, not via this prompt.
-        obs_for_prompt = observation
-        prompt = (
-            "Summarize the overall contract search results in 2-4 sentences." + NL +
-            "Focus on the main patterns, common themes, and whether the results " + NL +
-            "suggest approvals, renewals, risk flags, or other notable trends. " + NL +
-            "Do not list record IDs, raw field names, or paste large excerpts. " + NL +
-            "Use plain English and be concise." + NL + NL +
-            f"User query: {query}" + NL +
-            f"Tool: {tool}" + NL +
-            f"Evidence:" + NL + obs_for_prompt
-        )
-
-        llm = self._get_llm()
-        if llm is None:
-            return self._fallback_summary(observation)
-
-        try:
-            response = llm.invoke([("human", prompt)])
-            text = getattr(response, "content", "") or str(response)
-            text = text.strip()
-            if text:
-                return text
-        except Exception as e:
-            logger.warning("LLM synthesis failed (%s); using fallback summary", e)
-        return self._fallback_summary(observation)
+        return self._get_synthesizer().synthesize(query, tool, observation)
 
     @staticmethod
     def _fallback_summary(observation: str) -> str:
-        """Deterministic, human-readable summary when no LLM is available.
-
-        Never returns the raw prompt or an evidence dump.
-        """
-        obs = observation or ""
-        n = obs.count(chr(91))  # '[' begins each numbered evidence entry
-        if n <= 0:
-            return (
-                "I found matching contracts, but the language model is unavailable, "
-                "so I cannot summarize them right now. Browse the results below for details."
-            )
-        return (
-            f"I found {n} matching contract{'s' if n != 1 else ''}, but the language "
-            "model is unavailable, so I cannot summarize them right now. Browse the "
-            "results below for details."
-        )
+        """Deterministic no-LLM summary (delegates to the synthesis module)."""
+        return AnswerSynthesizer.fallback_summary(observation)
 
     # ── main entry ─────────────────────────────────────────────
     def process(self, user_input: str, on_stage: Optional[Callable] = None,
@@ -946,7 +924,12 @@ class LangChainAgent:
                                 tool_meta_log=self._tool_meta_log)
                 for t in self._tools
             ]
-            self._react_agent = _create_react_agent(model, tools=tools)
+            # The legacy langgraph.prebuilt.create_react_agent path emits a
+            # LangGraphDeprecatedSinceV10 warning at call time; suppress that
+            # single known warning so it does not drown real test warnings.
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                self._react_agent = _create_react_agent(model, tools=tools)
         except Exception as e:
             logger.warning("Failed to init LangGraph agent: %s", e)
             self._react_agent = None

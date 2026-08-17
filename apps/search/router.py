@@ -36,6 +36,7 @@ from typing import Any, Dict, Optional
 from apps.search._core import LITELLM_API_KEY, LITELLM_BASE_URL, LITELLM_MODEL
 from apps.search.intents import (
     CONTRACT_FILTER_FIELDS,
+    DEFAULT_CLARIFICATION,
     INTENT_CLARIFY,
     INTENT_TO_TOOL,
     VALID_INTENTS,
@@ -138,7 +139,7 @@ class SearchRouter:
         clarification = str(parsed.get("clarification_question") or "").strip()
         if intent == INTENT_CLARIFY:
             decision["search"] = False
-            decision["clarification_question"] = clarification or                 "Could you narrow down which contract, counterparty, or risk area you mean?"
+            decision["clarification_question"] = clarification or DEFAULT_CLARIFICATION
         return decision
 
     @staticmethod

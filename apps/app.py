@@ -59,8 +59,9 @@ def check_llm_health(deep: bool = False) -> Dict[str, Any]:
     Phase-2 chat probe (deep=True, a full remote round-trip that can take
     10s+ on a loaded proxy) only runs via the sidebar "Recheck LLM" button."""
     return _check_llm_health_uncached(deep=deep)
-# Fallback clarification prompt when the agent cannot route a query.
-DEFAULT_CLARIFICATION = "Could you narrow down which contract or counterparty you mean?"
+# Fallback clarification prompt when the agent cannot route a query. The
+# canonical string lives in apps.search.intents so the UI and the agent agree.
+from apps.search.intents import DEFAULT_CLARIFICATION  # noqa: E402
 from apps.attachment_summary import (attachment_label, human_file_size, list_attachments,
     resolve_attachment_path, summarize_contract_with_attachment)
 from apps.detail_view import build_contextual_groups, coalesce_raw, humanize_signals

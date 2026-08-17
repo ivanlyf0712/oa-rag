@@ -24,7 +24,6 @@ from apps.search.intents import (
     INTENT_RISK,
     TOOL_CONTRACT_SEARCH,
     TOOL_NONE,
-    TOOL_RISK_SEARCH,
 )
 from apps.search.router import SearchRouter
 
@@ -55,13 +54,16 @@ def test_contract_content_question_searches_contract_tool():
 
 
 # ── intent model ─────────────────────────────────────────────────
-def test_risk_intent_routes_to_risk_tool():
+def test_risk_intent_routes_to_unified_contract_tool():
+    # Risk intent is kept (it drives the service's risk rank-hint), but it
+    # routes to the unified contract_search tool: risk scoring/ranking happens
+    # inside the unified pipeline, not a separate risk tool.
     router = _router_returning(
         '{"search": true, "intent": "risk", "query": "risk not accepted"}'
     )
     d = router.decide("show contracts where risk was not accepted")
     assert d["intent"] == INTENT_RISK
-    assert d["tool"] == TOOL_RISK_SEARCH
+    assert d["tool"] == TOOL_CONTRACT_SEARCH
 
 
 def test_counterparty_intent_maps_filter():

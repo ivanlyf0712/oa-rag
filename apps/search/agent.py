@@ -30,6 +30,7 @@ from apps.search.intents import (
     TOOL_RISK_SEARCH,
 )
 from apps.search.router import SearchRouter
+from apps.search.synthesis import EMPTY_OBSERVATION_MESSAGE
 
 logger = logging.getLogger("oa-search.agent")
 
@@ -250,8 +251,9 @@ class CrossTableAgent:
 
     # ── answer synthesis (LLM with deterministic fallback) ───────
     def _synthesize(self, query: str, tool: str, observation: str) -> str:
+        # Shared empty-result message (single source in apps.search.synthesis).
         if not observation or not observation.strip():
-            return "No matching contracts were found."
+            return EMPTY_OBSERVATION_MESSAGE
         try:
             return self._llm_summarize(query, tool, observation)
         except Exception as e:

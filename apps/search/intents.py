@@ -31,13 +31,23 @@ TOOL_RISK_SEARCH = "risk_search"
 TOOL_CONTRACTS_WHERE = "contracts_where"
 TOOL_NONE = "none"
 
+# Risk is computed inside the unified contract_search pipeline (the service
+# ranks every candidate set by risk), so the risk intent routes to the same
+# contract_search tool rather than a separate risk tool.
 INTENT_TO_TOOL: Dict[str, str] = {
     INTENT_GENERAL: TOOL_CONTRACT_SEARCH,
-    INTENT_RISK: TOOL_RISK_SEARCH,
+    INTENT_RISK: TOOL_CONTRACT_SEARCH,
     INTENT_COUNTERPARTY: TOOL_CONTRACT_SEARCH,
     INTENT_RENEWAL: TOOL_CONTRACT_SEARCH,
     INTENT_CLARIFY: TOOL_NONE,
 }
+
+# Single source of truth for the vague-query clarifying question. The router,
+# the agents, the risk planner, and the Streamlit UI all import this so the
+# user sees one consistent clarification voice.
+DEFAULT_CLARIFICATION = (
+    "Could you narrow down which contract, counterparty, or risk area you mean?"
+)
 
 # Contract-domain filter fields a query can map onto.
 FILTER_CONTRACT_TYPE = "contract_type"
