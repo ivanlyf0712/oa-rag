@@ -1,0 +1,16 @@
+# Dev override — bind-mounts source code into the container so code changes
+# take effect with a container restart, no image rebuild needed.
+#
+#   make dev-up        # build once + start with live source mounts
+#   make dev-restart   # after editing code: restart picks up the new code
+#
+# Plain `make up` (without this file) goes back to the baked-in image.
+# Named volumes from docker-compose.yml (hf-cache, uploads, index) are
+# untouched — the index volume still mounts on top of the bind mount at
+# /app/apps/search_index.
+services:
+  app:
+    volumes:
+      - ./apps:/app/apps:ro
+      - ./core:/app/core:ro
+      - ./scripts:/app/scripts:ro

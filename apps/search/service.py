@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from apps.search._core import Searcher, _clean_text_from_enriched
+
+from apps.search.status_labels import normalize_status as _sl_normalize_status
 from apps.search.where_sql import condition_to_sql
 from apps.risk_search import (
     MODE_RISKY,
@@ -83,14 +85,14 @@ def _looks_like_ref_no(query: str) -> bool:
 
 
 def _normalize_status(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if not text:
-        return None
-    if text in {"done", "finished", "complete"}:
-        return "completed"
-    return text
+    """Normalize a user-supplied status filter to a canonical DB status label.
+
+    The user query may contain loose language like "pending approval", "done",
+    "completed" that does not exactly match the DB status labels. This delegates
+    to the shared status_labels.normalize_status so the semantic post-filter and
+    the agent resolve aliases identically (single source of truth).
+    """
+    return _sl_normalize_status(value)
 
 
 def _parse_bool(value: Any) -> Optional[bool]:

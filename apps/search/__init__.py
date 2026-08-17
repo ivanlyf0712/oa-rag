@@ -63,3 +63,4 @@ from apps.search.langchain_agent import (  # noqa: F401
     build_default_llm,
     build_langchain_tools,
 )
+from apps.search.persona import DispositionProfile  # noqa: F401

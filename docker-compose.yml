@@ -6,14 +6,17 @@
 #   docker compose down            # stop (data volumes kept)
 #
 # Services:
-#   mysql — MySQL 8 for contract data (form tables + contract_attachments).
-#           Host port 3307 -> 3306 (3306 is taken by the local MySQL).
-#   app   — Streamlit UI on :8501 (agent + search + detail views).
+#   mysql      — MySQL 8 for contract data (form tables + contract_attachments).
+#                Host port 3307 -> 3306 (3306 is taken by the local MySQL).
+#   hindsight  — Hindsight memory layer (API :8888, Web UI :9999).
+#                Data persisted in the hindsight-data volume.
+#   app        — Streamlit UI on :8501 (agent + search + detail views).
 #
 # Named volumes (created automatically, image content copied up on first run):
 #   oa-mysql-data — database files; oa-uploads — contract attachment files;
 #   oa-index — search index (refresh with: make index);
-#   hf-cache — bge-m3 / reranker model cache (~3.5G, avoids re-download).
+#   hf-cache — bge-m3 / reranker model cache (~3.5G, avoids re-download);
+#   hindsight-data — Hindsight embedded database (pg0, persistence).
 
 services:
   mysql:
@@ -34,6 +37,31 @@ services:
       interval: 5s
       timeout: 3s
       retries: 24
+
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:latest
+    container_name: oa-hindsight
+    restart: unless-stopped
+    environment:
+      # Use litellm proxy (same as the app) instead of requiring a separate key.
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_MODEL: ${LITELLM_MODEL:-dseek-v4-flash}
+      HINDSIGHT_API_LLM_API_KEY: ${LITELLM_API_KEY:?LITELLM_API_KEY must be set in .env}
+      HINDSIGHT_API_LLM_BASE_URL: ${LITELLM_BASE_URL:-https://litellm.dchbi.app/}/v1
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
+      HINDSIGHT_API_RERANKER_PROVIDER: flashrank
+      HINDSIGHT_API_WORKER_ID: oa-hindsight-prod
+    ports:
+      - "8888:8888"   # API
+      - "9999:9999"   # Control Plane Web UI
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0   # memory persistence (pg0 embedded db)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8888/v1/default/banks 2>/dev/null | grep -q 'banks'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
 
   app:
     build: .
@@ -56,6 +84,12 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
       RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-base}
       INDEX_PATH: /app/apps/search_index
+      # Hindsight memory bridge (optional; feature off when bank id is empty)
+      HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-http://hindsight:8888}
+      HINDSIGHT_BANK_ID: ${HINDSIGHT_BANK_ID:-}
+      HINDSIGHT_API_TIMEOUT: ${HINDSIGHT_API_TIMEOUT:-10}
+      # Web UI base URL for Settings-page links (browser-side, so localhost)
+      HINDSIGHT_UI_URL: ${HINDSIGHT_UI_URL:-http://localhost:9999}
     ports:
       - "8501:8501"
     volumes:
@@ -65,9 +99,12 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      hindsight:
+        condition: service_healthy
 
 volumes:
   oa-mysql-data:
   hf-cache:
   oa-uploads:
   oa-index:
+  hindsight-data:

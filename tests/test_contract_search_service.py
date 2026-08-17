@@ -70,9 +70,13 @@ def test_looks_like_ref_no():
 
 
 def test_normalize_status_synonyms():
-    assert _normalize_status("done") == "completed"
-    assert _normalize_status("Finished") == "completed"
-    assert _normalize_status("completed") == "completed"
+    # Synonyms resolve to the canonical DB status label (core.db.STATUS_LABELS),
+    # matching the Title-Case labels stored in contract metadata (status_label).
+    assert _normalize_status("done") == "Completed"
+    assert _normalize_status("Finished") == "Completed"
+    assert _normalize_status("completed") == "Completed"
+    # Exact DB label passthrough (case-insensitive).
+    assert _normalize_status("Pending Approval") == "Pending Approval"
     assert _normalize_status(None) is None
 
 

@@ -37,6 +37,13 @@ from apps.search import (
     load_index,
 )
 from apps.search.result_store import clear_results, snapshot_results
+from apps.search.hindsight_client import get_disposition, get_entity_graph, retain as hs_retain
+from apps.search.agent_config import (PRESET_LABELS, STYLE_LABELS, apply_preset,
+                                      default_agent_config, persona_to_profile_dict,
+                                      preset_index, style_index)
+from apps.search.persona import DispositionProfile
+from apps.search.memory import Memory
+from apps.search.session import build_agent as _build_search_agent
 from apps.search_cli import build_contract_tool, build_where_tool
 try:
     from apps.search.langchain_agent import check_llm_health as _check_llm_health_uncached
@@ -67,33 +74,73 @@ def _load_embeddings(index_path: str):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Hindsight cross-session memory (ported from corpchat-rag)
+# ─────────────────────────────────────────────────────────────────────
+def _memory() -> Memory:
+    """Cross-session memory module bound to the live Streamlit session.
+
+    hs_retain is passed as the retain adapter so tests can patch the seam at
+    the app module boundary.
+    """
+    return Memory(st.session_state, retain_fn=hs_retain)
+
+
+def _get_hindsight_bank() -> str:
+    """Active Hindsight bank id (delegates to the Memory module)."""
+    return _memory().resolve_bank()
+
+
+def _get_hindsight_ui_url() -> str:
+    """Base URL of the Hindsight Web UI (must be reachable from the browser)."""
+    return Memory.ui_url()
+
+
+def _load_hindsight_profile(bank: str) -> Optional[DispositionProfile]:
+    """Bank disposition → DispositionProfile, cached per bank for the session.
+
+    The profile only changes when someone edits the bank disposition in the
+    Hindsight Web UI; re-fetch when the bank changes. Hindsight unreachable →
+    neutral profile (graceful degradation).
+    """
+    if not bank:
+        return None
+    return _memory()._load_profile(bank)
+
+
+def _build_retain_content(query: str, rows: List[Dict[str, Any]],
+                          max_rows: int = 3) -> str:
+    """Compose a compact memory document for one agent turn (pure, testable)."""
+    return Memory.build_retain_content(query, rows, max_rows=max_rows)
+
+
+def _retain_turn_to_hindsight(query: str, rows: List[Dict[str, Any]],
+                              bank: str) -> bool:
+    """Best-effort async retain of one agent turn into the Hindsight bank.
+
+    Entity-anchor tags (counterparties + ref_nos) let Hindsight link the
+    memory into its entity graph for later recall.
+    """
+    return _memory()._retain(query, rows, bank)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _hindsight_graph_stats(bank: str) -> Dict[str, Any]:
+    return Memory.graph_stats(bank)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Agentic layer (Epic: unified LangChain agentic UI)
 # ─────────────────────────────────────────────────────────────────────
 def _build_agent(index_path: str, embeddings):
-    """Build the LangChain tool-calling agent over the existing pipelines.
+    """Build the tool-calling agent (delegates to the SearchSession module).
 
-    Falls back to the manual-ReAct CrossTableAgent only when the provider is
-    genuinely unavailable or misconfigured. If the provider package is present,
-    we prefer the LangChain agent.
+    Keeps Streamlit-specific concerns here (the caption sink, the tool
+    factories); the provider fallback + memory bridge live in session.py.
     """
-    # Unified pipeline (tickets 01-02): ONE search tool for contract and risk
-    # search; the risk tool is retired as a separate LLM tool. Ticket 05 adds
-    # contracts_where for exact structured retrieval (Phase 2).
     contract_tool = build_contract_tool(embeddings)
     where_tool = build_where_tool(embeddings)
-    try:
-        from apps.search.langchain_agent import build_default_llm, AgentConfigError, check_llm_health
-    except Exception as e:  # import failure → manual agent
-        st.caption(f"LangChain agent unavailable (import failed: {e}); using built-in router agent.")
-        return CrossTableAgent(contract_tool=contract_tool, where_tool=where_tool)
-
-    try:
-        llm = build_default_llm(api_key=os.getenv("LITELLM_API_KEY", ""))
-    except AgentConfigError as e:
-        st.caption(f"LangChain agent unavailable ({e}); using built-in router agent.")
-        return CrossTableAgent(contract_tool=contract_tool, where_tool=where_tool)
-
-    return LangChainAgent(contract_tool=contract_tool, where_tool=where_tool, llm=llm)
+    return _build_search_agent(
+        contract_tool, where_tool, _memory(), notify=st.caption)
 
 
 def _get_summary_llm():
@@ -189,6 +236,19 @@ def _render_agent_metadata(result: Dict[str, Any]):
         st.caption(f"Tool: **{tool_label}**")
     with col3:
         st.caption(f"Routing: **{'Fallback' if fallback else 'LangChain'}**")
+
+    hs = result.get("hindsight") or {}
+    if hs.get("bank"):
+        recall_state = hs.get("recall", "skip")
+        if "retained" in hs:
+            retain_state = ("retained (async)" if hs["retained"]
+                            else "retain failed (Hindsight down?)")
+        else:
+            retain_state = "not retained (turn failed)"
+        recall_text = ("memory recall used" if recall_state == "recall"
+                       else "recall skipped (no memory trigger word)")
+        st.caption("🧠 Memory: bank `%s` — %s · %s" % (
+            hs["bank"], recall_text, retain_state))
 
     with st.expander("Agent steps"):
         for step in result.get("steps", []):
@@ -337,11 +397,23 @@ def _render_agentic(index_path: str):
     """
     st.session_state["index_path"] = index_path  # for cached evidence search
     st.subheader("Ask")
-    st.caption(
-        "Ask in natural language — e.g. 'which contracts mention unlimited liability', "
-        "'show completed contracts with Acme', or 'is CCA20250096 expired'. The agent "
-        "maps filters and searches the contract corpus automatically."
-    )
+    st.caption("Ask in natural language — the agent maps filters and searches the contract corpus automatically.")
+
+    # ── Suggestion pills ──
+    _suggestions = [
+        "which contracts mention unlimited liability",
+        "show completed contracts with Acme",
+        "is CCA20250096 expired",
+    ]
+    # Track which suggestion was clicked so we can pre-fill the input.
+    if "agentic_suggested" not in st.session_state:
+        st.session_state["agentic_suggested"] = ""
+    cols = st.columns(len(_suggestions))
+    for idx, s in enumerate(_suggestions):
+        label = s[:35] + "…" if len(s) > 36 else s
+        if cols[idx].button(label, key=f"agentic_pill_{idx}", use_container_width=True):
+            st.session_state["agentic_suggested"] = s
+            st.session_state["agentic_query"] = s
 
     embeddings = _load_embeddings(index_path)
     searcher = Searcher(embeddings)
@@ -349,7 +421,7 @@ def _render_agentic(index_path: str):
 
     query = st.text_input(
         "Your question",
-        value="show contracts where risk was not accepted",
+        value=st.session_state.get("agentic_query", ""),
         key="agentic_query",
     )
 
@@ -369,6 +441,18 @@ def _render_agentic(index_path: str):
                 else:
                     raise
         progress.empty()
+        # Cross-session memory: retain the turn and record a typed outcome.
+        # Recall participation mirrors corpchat's Process window: the agent logs
+        # a "Hindsight memory" step only when the gate fired recall.
+        mem = _memory()
+        turn = mem.prepare_turn(query)
+        hs_recalled = any(s.get("label") == "Hindsight memory"
+                          for s in result.get("steps", []))
+        outcome = mem.complete_turn(
+            query, snapshot_results().get("rows") or [], turn,
+            recalled=hs_recalled, turn_succeeded=bool(result.get("success")))
+        if outcome.bank:
+            result["hindsight"] = outcome.to_dict()
         st.session_state["agentic_result"] = result
 
     result = st.session_state.get("agentic_result")
@@ -759,6 +843,158 @@ def _render_dashboard(index_path: str):
         st.line_chart(date_series.value_counts().sort_index())
 
 
+def _render_settings_page():
+    """Settings page — same panels as corpchat's ⚙️ Settings → Configure Agent.
+
+    The Hindsight bridge is a read-only mirror: with a bank id set, the CARA
+    persona is driven by the Hindsight bank's disposition (single source of
+    truth) and editing happens in the Hindsight Web UI; without a bank the
+    local sliders apply (neutral defaults = unchanged answers).
+    """
+    st.header("⚙️ Settings")
+    cfg = st.session_state.get("agent_config")
+    if cfg is None:
+        cfg = default_agent_config()
+        st.session_state.agent_config = cfg
+
+    with st.expander("🧠 Personality (CARA)", expanded=True):
+        # ── Hindsight bridge (read-only mirror mode) ──
+        # With a bank id set: persona is driven by Hindsight, sliders only
+        # display the Hindsight values. Edit in the Hindsight Web UI (link
+        # below) or click Refresh to re-pull.
+        hs_bank = st.text_input(
+            "Hindsight memory bank (optional)",
+            value=_get_hindsight_bank(),
+            key="hindsight_bank_input",
+            help="Enter a Hindsight bank ID (e.g. oa-rag) to drive the persona from that "
+                 "bank's disposition (read-only mirror); leave empty to use the local sliders below.",
+        ).strip()
+        st.session_state["hindsight_bank"] = hs_bank
+        cfg["persona"]["hindsight_bank"] = hs_bank
+        hs_driven = bool(hs_bank)
+
+        # Effective persona: Hindsight value when connected, else local sliders.
+        # Cached per bank for the session; re-fetched on bank change / Refresh.
+        # Unreachable is NOT cached, so the probe retries on the next rerun.
+        effective = None
+        unreachable = False
+        if hs_driven:
+            cache_key = "_hindsight_profile_" + hs_bank
+            effective = st.session_state.get(cache_key)
+            if effective is None:
+                if get_disposition(hs_bank):
+                    effective = DispositionProfile.from_hindsight(hs_bank)
+                    st.session_state[cache_key] = effective
+                else:
+                    unreachable = True
+
+        col_link, col_refresh = st.columns([3, 1])
+        with col_link:
+            if hs_driven:
+                st.link_button(
+                    "🔗 Adjust in Hindsight",
+                    "%s/banks/%s/" % (_get_hindsight_ui_url(), hs_bank),
+                    type="secondary",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("Not connected to Hindsight — using the local sliders below")
+        with col_refresh:
+            if hs_driven and st.button("🔄 Refresh", use_container_width=True):
+                st.session_state.pop("_hindsight_profile_" + hs_bank, None)
+                _hindsight_graph_stats.clear()
+                st.rerun()
+
+        if unreachable:
+            st.caption("⚠️ Cannot reach Hindsight (or the bank has no disposition yet) "
+                       "— using the local sliders below")
+        elif hs_driven and effective is not None:
+            st.caption(
+                f"🔗 Personality driven by Hindsight: skepticism {effective.skepticism:.0%} · "
+                f"literality {effective.literality:.0%} · empathy {effective.empathy:.0%}"
+                f" (adjust in the Hindsight Web UI)"
+            )
+
+
+        # Sliders: read-only mirror of Hindsight values when connected;
+        # locally editable otherwise.
+        hs_ro = hs_driven and effective is not None
+        if hs_ro:
+            # Hindsight 0-1 → 0-10 display scale (read-only)
+            sk_val = int(round(effective.skepticism * 10))
+            li_val = int(round(effective.literality * 10))
+            em_val = int(round(effective.empathy * 10))
+        else:
+            sk_val = int(cfg["persona"].get("skepticism", 5))
+            li_val = int(cfg["persona"].get("literality", 5))
+            em_val = int(cfg["persona"].get("empathy", 5))
+
+        preset_label = st.selectbox(
+            "Preset mode", list(PRESET_LABELS.keys()),
+            index=preset_index(cfg["persona"].get("preset", "custom")),
+            disabled=hs_ro,
+        )
+        preset_changed = (PRESET_LABELS.get(preset_label, "custom")
+                          != cfg["persona"].get("preset", "custom"))
+        if preset_changed:
+            apply_preset(cfg, preset_label)
+
+        # Push preset / Hindsight-mirror values into slider widget state before
+        # instantiation (changing st.slider's value arg alone does not move an
+        # already-instantiated widget).
+        if hs_ro:
+            st.session_state["settings_sk"] = sk_val
+            st.session_state["settings_li"] = li_val
+            st.session_state["settings_em"] = em_val
+        elif preset_changed and cfg["persona"]["preset"] != "custom":
+            st.session_state["settings_sk"] = int(cfg["persona"]["skepticism"])
+            st.session_state["settings_li"] = int(cfg["persona"]["literality"])
+            st.session_state["settings_em"] = int(cfg["persona"]["empathy"])
+
+        cfg["persona"]["skepticism"] = st.slider(
+            "Skepticism", 0, 10, sk_val, key="settings_sk",
+            help="Mark uncertainty on conclusions with insufficient evidence",
+            disabled=hs_ro)
+        cfg["persona"]["literality"] = st.slider(
+            "Literality", 0, 10, li_val, key="settings_li",
+            help="Answer strictly from the retrieved text",
+            disabled=hs_ro)
+        cfg["persona"]["empathy"] = st.slider(
+            "Empathy", 0, 10, em_val, key="settings_em",
+            help="Acknowledge tone/feelings before giving information",
+            disabled=hs_ro)
+        style_label = st.selectbox(
+            "Answer length", list(STYLE_LABELS.keys()),
+            index=style_index(cfg["persona"].get("style", "balanced")),
+            disabled=hs_ro)
+        cfg["persona"]["style"] = STYLE_LABELS[style_label]
+
+    with st.expander("🧠 Hindsight memory", expanded=False):
+        bank = _get_hindsight_bank()
+        if not bank:
+            st.caption("Set a Hindsight memory bank above to enable cross-session "
+                       "memory (every Ask turn is retained; queries referring to "
+                       "earlier sessions trigger a gated recall).")
+        else:
+            graph = _hindsight_graph_stats(bank)
+            if graph:
+                st.caption("Entities: %s · edges: %s (bank `%s`)" % (
+                    graph.get("total_entities", 0), graph.get("total_edges", 0), bank))
+            else:
+                st.caption("Hindsight unreachable or bank empty (`%s`)." % bank)
+            st.link_button("🔗 Open Hindsight Web UI",
+                           "%s/banks/%s/" % (_get_hindsight_ui_url(), bank),
+                           type="secondary")
+
+    with st.expander("📊 Table columns", expanded=False):
+        sidebar_cols = st.multiselect(
+            "Table columns", _TABLE_BASE_COLUMNS + _TABLE_EXTRA_COLUMNS,
+            default=_TABLE_BASE_COLUMNS, key="sidebar_columns_picker",
+        )
+        st.session_state["sidebar_columns_"] = sidebar_cols
+
+
+
 def main():
     st.set_page_config(page_title="OA Contract Screening", layout="wide")
     st.title("OA Contract Screening")
@@ -766,7 +1002,10 @@ def main():
                "to the right search tool and shows its reasoning.")
 
     index_path = st.sidebar.text_input("Index path", value=DEFAULT_INDEX_PATH)
-    page = st.sidebar.radio("View", ["Ask (Agentic)", "Browse", "Dashboard"], index=0)
+    page = st.sidebar.radio("View", ["Ask (Agentic)", "Browse", "Dashboard", "Settings"], index=0)
+
+    if "agent_config" not in st.session_state:
+        st.session_state.agent_config = default_agent_config()
 
     if not os.path.exists(index_path):
         st.error(f"Index path not found: {index_path}")
@@ -780,13 +1019,7 @@ def main():
         )
     else:
         st.caption("LLM ready: " + chr(96) + str(health.get("model")) + chr(96))
-    # Settings expander in sidebar: column picker (moved inline to save space)
-    with st.sidebar.expander("Settings"):
-        sidebar_cols = st.multiselect(
-            "Table columns", _TABLE_BASE_COLUMNS + _TABLE_EXTRA_COLUMNS,
-            default=_TABLE_BASE_COLUMNS, key="sidebar_columns_picker",
-        )
-        st.session_state["sidebar_columns_"] = sidebar_cols
+    # Persona / Hindsight / table-column settings live on the Settings page.
 
     # On-demand live generation probe (off the per-rerun critical path).
     if st.sidebar.button("Recheck LLM (live probe)"):
@@ -802,8 +1035,10 @@ def main():
         _render_agentic(index_path)
     elif page == "Browse":
         _render_browser(index_path)
-    else:
+    elif page == "Dashboard":
         _render_dashboard(index_path)
+    else:
+        _render_settings_page()
 
 
 if __name__ == "__main__":

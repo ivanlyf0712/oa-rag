@@ -3,7 +3,7 @@
 # Operational helpers mirroring corpchat-rag: validate .env, then run the
 # compose stack (mysql + app).
 
-.PHONY: help check-env up down logs ps build test index db-import restart
+.PHONY: help check-env up down logs ps build test index db-import restart dev-up dev-restart
 
 help:
 	@echo "OA Contract RAG targets:"
@@ -42,6 +42,12 @@ build:
 	docker compose build
 
 restart:
+	docker compose restart app
+
+dev-up: check-env ## Start with live source mounts; NO build — uses existing image (run `make build` first only if deps changed)
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+dev-restart: ## Restart container to pick up source changes (no rebuild; needs make dev-up first)
 	docker compose restart app
 
 test:

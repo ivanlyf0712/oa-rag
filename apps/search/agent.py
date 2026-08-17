@@ -16,9 +16,12 @@ index, database, or LLM.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from apps.search._core import LITELLM_API_KEY, LITELLM_BASE_URL, LITELLM_MODEL
+from apps.search.hindsight_client import needs_recall, recall as hs_recall
 from apps.search.intents import (
     INTENT_CLARIFY,
     TOOL_CONTRACT_SEARCH,
@@ -67,6 +70,8 @@ class CrossTableAgent:
         api_base: Optional[str] = None,
         api_key: Optional[str] = None,
         model: str = LITELLM_MODEL,
+        profile: Any = None,
+        hindsight_bank: Optional[str] = None,
     ):
         self.api_base = api_base or LITELLM_BASE_URL
         self.api_key = api_key or LITELLM_API_KEY
@@ -78,6 +83,9 @@ class CrossTableAgent:
         self.where_tool = where_tool
         self.router = router or SearchRouter(api_base=self.api_base,
                                              api_key=self.api_key, model=self.model)
+        self.profile = profile
+        # Hindsight 记忆银行 ID; None/空 → 不做跨会话记忆 recall
+        self.hindsight_bank = hindsight_bank or os.getenv("HINDSIGHT_BANK_ID") or None
         self._steps: List[Dict[str, Any]] = []
 
     # ── process timeline ─────────────────────────────────────────
@@ -108,12 +116,47 @@ class CrossTableAgent:
                 "fallback": False,
             }
 
-        # ── Step 1: routing decision (degrades safely without LLM) ──
-        _stage("🧠", "routing...")
-        decision = self.router.decide(query)
-        intent = decision.get("intent", "general")
+        # ── Step 1: classify the query ──
+        _stage("🧭", "routing...")
+        self._add_step("🧭", "Routing", f"Query: '{query[:60]}'")
+
+        # Hindsight on-demand recall (决策 16/17): 仅命中显式跨会话引用词
+        # (上次/之前/还记得/remember/previously...) 才注入历史记忆; 未命中则静默跳过。
+        agent_input = query
+        if self.hindsight_bank and needs_recall(query):
+            _mem_t0 = time.perf_counter()
+            memories: List[Dict[str, Any]] = []
+            try:
+                memories = hs_recall(query, bank=self.hindsight_bank, max_results=5)
+            except Exception as e:
+                logger.debug("Hindsight recall failed: %s", e)
+            _mem_ms = int((time.perf_counter() - _mem_t0) * 1000)
+            self._add_step(
+                "🧠", "Hindsight memory",
+                "recall on '%s' (%d memories, %dms)" % (query[:40], len(memories), _mem_ms),
+            )
+            if memories:
+                lines = []
+                for m in memories:
+                    content = str(m.get("content") or "").strip()
+                    if content:
+                        lines.append("- " + content)
+                if lines:
+                    agent_input = (
+                        query
+                        + "\n\n[Relevant cross-session memories (Hindsight bank %s)]:\n%s\n"
+                          "[Use these memories if relevant; ignore otherwise.]"
+                        % (self.hindsight_bank, "\n".join(lines))
+                    )
+
+        # Original routing logic (preserved from HEAD):
+        # - fallback detection via raw LLM output presence
+        # - risk tool → contract search degradation when risk tool is not wired
+        # - contracts_where routing for enumeration queries (ticket 05)
+        decision = self.router.decide(agent_input)
+        intent = decision.get("intent", INTENT_CLARIFY)
         tool = decision.get("tool", TOOL_CONTRACT_SEARCH)
-        retrieval_query = decision.get("query") or query
+        retrieval_query = decision.get("query") or agent_input
         filters = decision.get("filters") or {}
         used_fallback = not bool(decision.get("raw"))
         if tool == TOOL_RISK_SEARCH and not self._has_risk_tool:
@@ -133,15 +176,15 @@ class CrossTableAgent:
                 remainder = enumeration_remainder(query)
                 if not remainder or _condition_to_sql(remainder) is not None:
                     tool = TOOL_CONTRACTS_WHERE
-        self._add_step("🧠", "Routing", f"intent={intent}, tool={tool}")
+        self._add_step("🧭", "Routing", f"intent={intent}, tool={tool}")
 
         # ── Step 2: clarify / no-search → answer directly ──
         if not decision.get("search", True) or tool == TOOL_NONE:
-            clarification = decision.get("clarification_question") or                 "Could you tell me which contract, counterparty, or risk area you mean?"
+            clarification = decision.get("clarification_question") or "Please provide more details."
             self._add_step("💬", "Clarify", clarification[:60])
             return {
                 "output": clarification,
-                "intent": intent,
+                "intent": INTENT_CLARIFY,
                 "tool": TOOL_NONE,
                 "tool_calls": [],
                 "steps": self._steps,
@@ -220,14 +263,28 @@ class CrossTableAgent:
         # on failure chat() returns "" and we return the raw observation.
         from apps.search.litellm_client import LiteLLMClient
         source = "contract search"
-        prompt = (
+
+        # Build system prompt with persona instructions when a profile is set.
+        system_prompt = (
             f"You are a contract search assistant. Using ONLY the {source} results below, "
             f"answer the user's question concisely in the same language as the question. "
-            f"If the results are empty, say so honestly.\n\n"
+            f"If the results are empty, say so honestly."
+        )
+        if self.profile is not None:
+            try:
+                system_prompt = self.profile.build_system_prompt(system_prompt)
+            except Exception:
+                pass
+
+        user_prompt = (
             f"Question: {query}\n\nResults:\n{observation}\n\nAnswer:"
         )
+
         client = LiteLLMClient(api_base=self.api_base, api_key=self.api_key,
                                model=self.model)
-        content = client.chat([{"role": "user", "content": prompt}],
-                              temperature=0.1, max_tokens=512, timeout=30).strip()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        content = client.chat(messages, temperature=0.1, max_tokens=512, timeout=30).strip()
         return content or observation

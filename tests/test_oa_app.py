@@ -21,6 +21,9 @@ class _Ctx:
     def __exit__(self, *exc):
         return False
 
+    def __getattr__(self, name):
+        return lambda *a, **k: self
+
 
 class _Recorder:
     def __init__(self):

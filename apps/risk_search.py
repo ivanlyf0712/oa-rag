@@ -239,7 +239,12 @@ def score_risk(
         total = 0
         signals: List[str] = []
         for (field, value), pts in weights.items():
-            if _row_decoded_label(row, field) == value:
+            label = _row_decoded_label(row, field)
+            # Risk-acceptance N/A (field never filled) is equivalent to "no";
+            # the contract's risk posture was never assessed → treat as high-risk.
+            if field == "IsRisksAccepted" and label == "na":
+                label = "no"
+            if label == value:
                 total += pts
                 signals.append(f"{field} = {value} (+{pts})")
         severity = _severity_for(total, tiers)

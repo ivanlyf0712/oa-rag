@@ -44,10 +44,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from apps.search._core import LITELLM_API_KEY, LITELLM_BASE_URL, LITELLM_MODEL
+from apps.search.hindsight_client import needs_recall, recall as hs_recall
 from apps.search.litellm_client import LiteLLMClient
 from apps.search.intents import (
     INTENT_CLARIFY,
@@ -63,6 +66,24 @@ from apps.search.intents import (
 )
 from apps.search.router import SearchRouter
 from apps.search.service import _looks_like_ref_no
+
+# Pydantic is a soft dependency — if missing we degrade to the bare Dict args_schema
+# the agent already used, so the LLM sees no filter-key guidance (existing behaviour).
+try:
+    from pydantic import BaseModel, Field
+    _PYDANTIC_AVAILABLE = True
+except ImportError:
+    _PYDANTIC_AVAILABLE = False
+    BaseModel = object
+    Field = lambda *a, **kw: None
+
+# Pull the actual label dictionaries from the DB layer so the LLM can map
+# user language onto the real coded labels stored in the contract metadata.
+try:
+    from core.db import STATUS_LABELS as _DB_STATUS_LABELS, CONTRACT_TYPE_LABELS as _DB_CTYPE_LABELS
+except ImportError:
+    _DB_STATUS_LABELS: dict = {}
+    _DB_CTYPE_LABELS: dict = {}
 
 logger = logging.getLogger("oa-search.langchain-agent")
 
@@ -86,6 +107,55 @@ def _missing_contract_tool(query: str, filters: Dict[str, str]) -> str:
 
 def _missing_risk_tool(query: str) -> str:
     raise RuntimeError("risk_search tool is not configured")
+
+
+from apps.search.status_labels import STATUS_ALIASES as _SHARED_STATUS_ALIASES
+from apps.search.filters import (
+    infer_contract_filters as _infer_filters,
+    CONTRACT_TYPE_ALIASES as _FILTERS_CONTRACT_TYPE_ALIASES,
+    DEPARTMENT_ALIASES as _FILTERS_DEPARTMENT_ALIASES,
+)
+
+# ── Label dictionaries the LLM sees in the tool args_schema description ──
+# Format e.g. "Draft", "Pending Preliminary Review", ...
+_STATUS_LIST = list(_DB_STATUS_LABELS.values())
+# "NDA / Confidentiality Agreement", "MOU / LOI", ...
+_CTYPE_LIST = list(_DB_CTYPE_LABELS.values())
+_STATUS_DESC = ", ".join(f'"{v}"' for v in _STATUS_LIST) if _STATUS_LIST else '"Completed", "Draft", "Pending"'
+_CTYPE_DESC = ", ".join(f'"{v}"' for v in _CTYPE_LIST) if _CTYPE_LIST else '"NDA", "Service Agreement", "Procurement", "Lease", "Others"'
+
+
+class _ContractFiltersSchema(BaseModel):
+    """Explicit tool args_schema so the LLM sees the valid filter keys & values."""
+    query: str = Field(description="Natural-language query to search the contract corpus")
+    contract_type: str = Field(
+        default="",
+        description=f"Contract type to filter by. Valid values: {_CTYPE_DESC}. "
+                    "Leave empty when unspecified."
+    )
+    status: str = Field(
+        default="",
+        description=f"Status to filter by. Valid values: {_STATUS_DESC}. "
+                    "Leave empty when unspecified."
+    )
+    counterparty_name: str = Field(
+        default="",
+        description="Counterparty company name to filter by. Leave empty when unspecified."
+    )
+    department: str = Field(
+        default="",
+        description="Department name to filter by. Leave empty when unspecified."
+    )
+    date_from: str = Field(default="", description="Earliest contract start date (YYYY-MM-DD)")
+    date_to: str = Field(default="", description="Latest contract end date (YYYY-MM-DD)")
+    expired: bool = Field(default=False, description="Whether to filter to expired contracts only")
+    contract_id: str = Field(default="", description="Contract reference number to filter by")
+    # Pre-built filters dict (legacy / scripted callers). Merged with the
+    # individual fields above; individual fields win when both are present.
+    filters: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional pre-built filters dict; merged with the fields above."
+    )
 
 
 # ── Greeting / small-talk fast-path keywords ────────────────────
@@ -113,20 +183,45 @@ def build_langchain_tools(
     """
     from langchain_core.tools import tool
 
-    @tool(TOOL_CONTRACT_SEARCH)
-    def contract_search(query: str, filters: Optional[Dict[str, Any]] = None) -> str:
+    @tool(TOOL_CONTRACT_SEARCH,
+          args_schema=_ContractFiltersSchema if _PYDANTIC_AVAILABLE else None)
+    def contract_search(query: str, filters: Optional[Dict[str, Any]] = None,
+                        # Accept individual filter kwargs when the LLM supplies them
+                        # via args_schema; merged into the filters dict.
+                        contract_type: str = "",
+                        status: str = "",
+                        counterparty_name: str = "",
+                        department: str = "",
+                        date_from: str = "",
+                        date_to: str = "",
+                        expired: bool = False,
+                        contract_id: str = "",
+                        ) -> str:
         """Search the contract corpus semantically (hybrid keyword/vector).
 
         Use for general contract questions: clauses, breach, termination,
         liability, amounts, counterparties, renewal/expiry, dates, and
-        risk/compliance filters (status, expired, contract_id). This is the
-        DEFAULT tool for any general contract-content question.
+        risk/compliance filters. This is the DEFAULT tool for any
+        contract-content question.
 
-        Filters are optional key/value pairs. Supported keys: contract_type,
-        department, counterparty_name, status, expired, contract_id,
-        date_from, date_to.
+        Filter fields (all optional; omit when the user did not specify):
+        contract_type, status, counterparty_name, department, date_from,
+        date_to, expired, contract_id.
         """
-        return contract_tool(query, filters or {})
+        merged = dict(filters or {})
+        for key, val in [("contract_type", contract_type),
+                         ("status", status),
+                         ("counterparty_name", counterparty_name),
+                         ("department", department),
+                         ("date_from", date_from),
+                         ("date_to", date_to),
+                         ("expired", expired),
+                         ("contract_id", contract_id)]:
+            if val:
+                # When the LLM passes the value via the individual kwarg
+                # (from the Pydantic args_schema), prefer it over the dict.
+                merged.setdefault(key, val)
+        return contract_tool(query, merged)
 
     tools = [contract_search]
 
@@ -494,6 +589,7 @@ class LangChainAgent:
         api_base: Optional[str] = None,
         model: Optional[str] = None,
         profile: Any = None,
+        hindsight_bank: Optional[str] = None,
     ):
         self.contract_tool: ContractTool = contract_tool or _missing_contract_tool
         self._has_risk_tool = risk_tool is not None
@@ -502,6 +598,8 @@ class LangChainAgent:
         self._api_base = api_base
         self._model = model
         self.profile = profile
+        # Hindsight 记忆银行 ID; None/空 → 不做跨会话记忆 recall
+        self.hindsight_bank = hindsight_bank or os.getenv("HINDSIGHT_BANK_ID") or None
         self.router = router or SearchRouter(api_base=api_base, model=model or LITELLM_MODEL)
         self._synthesize = synthesize or self._default_synthesize
         self._has_where_tool = where_tool is not None
@@ -731,7 +829,35 @@ class LangChainAgent:
                         messages.append(("user", content))
                     elif role == "assistant":
                         messages.append(("assistant", content))
-            messages.append(("user", query))
+            # Hindsight on-demand recall (决策 16/17): 仅命中显式跨会话引用词
+            # (上次/之前/还记得/remember/previously...) 才注入历史记忆; 未命中则静默跳过。
+            user_content = query
+            if self.hindsight_bank and needs_recall(query):
+                _mem_t0 = time.perf_counter()
+                memories: List[Dict[str, Any]] = []
+                try:
+                    memories = hs_recall(query, bank=self.hindsight_bank, max_results=5)
+                except Exception as e:
+                    logger.debug("Hindsight recall failed: %s", e)
+                _mem_ms = int((time.perf_counter() - _mem_t0) * 1000)
+                self._add_step(
+                    "🧠", "Hindsight memory",
+                    "recall on '%s' (%d memories, %dms)" % (query[:40], len(memories), _mem_ms),
+                )
+                if memories:
+                    lines = []
+                    for m in memories:
+                        content = str(m.get("content") or "").strip()
+                        if content:
+                            lines.append("- " + content)
+                    if lines:
+                        user_content = (
+                            query
+                            + "\n\n[Relevant cross-session memories (Hindsight bank %s)]:\n%s\n"
+                              "[Use these memories if relevant; ignore otherwise.]"
+                            % (self.hindsight_bank, "\n".join(lines))
+                        )
+            messages.append(("user", user_content))
             _stage("running", "ReAct agent reasoning...")
             result = self._react_agent.invoke(
                 {"messages": messages},
@@ -826,6 +952,13 @@ class LangChainAgent:
             self._react_agent = None
 
     # ── System prompt & deterministic filter inference ────────────
+    # Shared status/contract-type label clause reused by the decision prompts
+    # (kept as one fragment so a label change is made once, not per-prompt).
+    _STATUS_CTYPE_CLAUSE = (
+        "Status labels in the system: " + _STATUS_DESC + ". "
+        "Contract types: " + _CTYPE_DESC + ". "
+    )
+
     _DECISION_SYSTEM = (
         "You are a contract search assistant for a legal/OA system. "
         "Decide which tool to call for the user's message. "
@@ -840,7 +973,8 @@ class LangChainAgent:
         "3) When using contract_search, if the query mentions status "
         "(e.g. completed, active, pending), expired contracts, or a specific "
         "contract id/ref number, include those values in the filters argument. "
-        "4) Greetings, small talk, or vague/ambiguous messages -> do NOT call any "
+        "4) " + _STATUS_CTYPE_CLAUSE +
+        "5) Greetings, small talk, or vague/ambiguous messages -> do NOT call any "
         "tool; instead reply with a short clarifying question. "
         "Always prefer calling a tool for genuine contract questions."
     )
@@ -860,14 +994,15 @@ class LangChainAgent:
         "2) When the query mentions status (e.g. completed, active, pending), "
         "expired contracts, or a specific contract id/ref number, include those "
         "values in the filters argument. "
-        "3) Greetings, small talk, or vague/ambiguous messages -> do NOT call any "
+        "3) " + _STATUS_CTYPE_CLAUSE +
+        "4) Greetings, small talk, or vague/ambiguous messages -> do NOT call any "
         "tool; instead reply with a short clarifying question. "
         "Always prefer calling the tool for genuine contract questions."
     )
 
     _DECISION_SYSTEM_WHERE = _DECISION_SYSTEM_UNIFIED + (
         " "
-        "4) Exact structured retrieval -> call contracts_where instead: "
+        "5) Exact structured retrieval -> call contracts_where instead: "
         "'list all contracts with <exact condition>' requests (amount "
         "comparisons, date bounds, coded flag labels, status filters), and "
         "bare 'list all contracts' (empty condition returns every contract). "
@@ -881,78 +1016,20 @@ class LangChainAgent:
             return self._DECISION_SYSTEM_WHERE
         return self._DECISION_SYSTEM if self._has_risk_tool else self._DECISION_SYSTEM_UNIFIED
 
-    _DEPARTMENT_ALIASES = {
-        "it": "IT",
-        "information technology": "IT",
-        "legal": "Legal",
-        "finance": "Finance",
-        "procurement": "Procurement",
-        "sales": "Sales",
-        "hr": "HR",
-        "human resources": "HR",
-        "operations": "Operations",
-    }
-
-    _STATUS_ALIASES = {
-        "completed": "completed",
-        "complete": "completed",
-        "done": "completed",
-        "active": "active",
-        "approved": "approved",
-        "pending": "pending",
-        "terminated": "terminated",
-    }
+    # Filter vocabulary lives in the dedicated filters module (single source
+    # of truth); these are thin back-compat references for existing callers.
+    _DEPARTMENT_ALIASES = _FILTERS_DEPARTMENT_ALIASES
+    _STATUS_ALIASES = _SHARED_STATUS_ALIASES
+    _CONTRACT_TYPE_ALIASES = _FILTERS_CONTRACT_TYPE_ALIASES
 
     @staticmethod
     def _infer_contract_filters(query: str) -> Dict[str, Any]:
-        """Deterministically extract contract facet filters from a query."""
-        text = (query or "").strip()
-        lower = text.lower()
-        filters: Dict[str, Any] = {}
-        if not lower:
-            return filters
+        """Deterministically extract contract facet filters from a query.
 
-        for needle, canonical in LangChainAgent._STATUS_ALIASES.items():
-            if re.search(rf"\b{re.escape(needle)}\b", lower):
-                filters["status"] = canonical
-                break
-
-        if re.search(r"\bexpired\b", lower):
-            filters["expired"] = True
-
-        m = re.search(
-            r"\b(?:contract\s*id|id|ref\s*no|reference\s*no)\b[:\s#-]*([A-Za-z0-9][A-Za-z0-9/_-]*)",
-            lower,
-        )
-        if m:
-            filters["contract_id"] = m.group(1)
-
-        m = re.search(r"\bdepartment\s+([A-Za-z][A-Za-z0-9/& -]*)", lower)
-        if m:
-            filters["department"] = m.group(1).strip()
-        else:
-            for needle, canonical in LangChainAgent._DEPARTMENT_ALIASES.items():
-                if re.search(rf"\b{re.escape(needle)}\b", lower):
-                    filters["department"] = canonical
-                    break
-
-        m = re.search(r"\bcounterparty\s+([A-Za-z][A-Za-z0-9/& ,.-]*)", lower)
-        if m:
-            filters["counterparty_name"] = m.group(1).strip()
-        else:
-            m = re.search(r"\bfrom\s+([A-Za-z][A-Za-z0-9/& ,.-]*)", lower)
-            if m:
-                filters["counterparty_name"] = m.group(1).strip()
-            else:
-                m = re.search(r"\bwith\s+([A-Za-z][A-Za-z0-9/& ,.-]*)", lower)
-                if m:
-                    filters["counterparty_name"] = m.group(1).strip()
-                else:
-                    m = re.search(r"\bfor\s+([A-Za-z][A-Za-z0-9/& ,.-]*)", lower)
-                    if m:
-                        filters["counterparty_name"] = m.group(1).strip()
-
-        return filters
+        Delegates to the filters module (single source of truth); kept as a
+        method for back-compat with existing callers/tests.
+        """
+        return _infer_filters(query)
 
     # ── deterministic router fallback ──────────────────────────
     def _run_from_router(self, query: str, _stage) -> Dict[str, Any]:

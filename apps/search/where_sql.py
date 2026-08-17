@@ -128,7 +128,9 @@ _RISK_ACCEPTED_RULES = (
     (("risk accepted", "risks accepted"), "IsRisksAccepted", "yes"),
 )
 
-_STATUS_WORDS = ("completed", "active", "pending", "draft", "terminated")
+# Status words for rule-based matching live in the filters module (single
+# source of truth for the status vocabulary); imported here as _STATUS_WORDS.
+from apps.search.filters import STATUS_WORDS as _STATUS_WORDS
 
 
 def _json_label_cond(field: str, value: str) -> str:
