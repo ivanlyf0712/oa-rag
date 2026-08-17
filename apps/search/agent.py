@@ -16,14 +16,11 @@ index, database, or LLM.
 from __future__ import annotations
 
 import logging
-import os
-import time
 from typing import Any, Callable, Dict, List, Optional
 
 from apps.search._core import LITELLM_API_KEY, LITELLM_BASE_URL, LITELLM_MODEL
-from apps.search.hindsight_client import needs_recall, recall as hs_recall
+from apps.search.agent_core import AgentCore
 from apps.search.intents import (
-    INTENT_CLARIFY,
     TOOL_CONTRACT_SEARCH,
     TOOL_CONTRACTS_WHERE,
     TOOL_NONE,
@@ -35,16 +32,10 @@ logger = logging.getLogger("oa-search.agent")
 
 # Tool callable signatures:
 #   contract_tool(query: str, filters: Dict[str, str]) -> str
-#   risk_tool(query: str) -> str
 ContractTool = Callable[[str, Dict[str, str]], str]
-RiskTool = Callable[[str], str]
 
 
-def _missing_contract_tool(query: str, filters: Dict[str, str]) -> str:
-    raise RuntimeError("contract_search tool is not configured")
-
-
-class CrossTableAgent:
+class CrossTableAgent(AgentCore):
     """Manual-ReAct agent over the unified contract search pipeline.
 
     Returns a dict with:
@@ -60,7 +51,7 @@ class CrossTableAgent:
     def __init__(
         self,
         contract_tool: Optional[ContractTool] = None,
-        risk_tool: Optional[RiskTool] = None,
+        risk_tool: Optional[Any] = None,  # deprecated/ignored (Candidate 2)
         where_tool: Optional[Callable[[str], str]] = None,
         router: Optional[SearchRouter] = None,
         api_base: Optional[str] = None,
@@ -69,168 +60,39 @@ class CrossTableAgent:
         profile: Any = None,
         hindsight_bank: Optional[str] = None,
     ):
+        super().__init__(contract_tool=contract_tool, where_tool=where_tool,
+                         profile=profile, hindsight_bank=hindsight_bank)
         self.api_base = api_base or LITELLM_BASE_URL
         self.api_key = api_key or LITELLM_API_KEY
         self.model = model
-        self.contract_tool: ContractTool = contract_tool or _missing_contract_tool
-        # Candidate 2: risk queries route to the unified contract_search tool;
-        # risk scoring/ranking happens inside the search service. The risk_tool
-        # parameter is accepted for backward compatibility but ignored.
-        self._has_where_tool = where_tool is not None
-        self.where_tool = where_tool
         self.router = router or SearchRouter(api_base=self.api_base,
                                              api_key=self.api_key, model=self.model)
-        self.profile = profile
-        # Hindsight 记忆银行 ID; None/空 → 不做跨会话记忆 recall
-        self.hindsight_bank = hindsight_bank or os.getenv("HINDSIGHT_BANK_ID") or None
-        self._steps: List[Dict[str, Any]] = []
 
-    # ── process timeline ─────────────────────────────────────────
-    def _add_step(self, icon: str, label: str, detail: str = "") -> None:
-        self._steps.append({"icon": icon, "label": label, "detail": detail})
+    # ── routing engine (Candidate 1: manual SearchRouter) ────────
+    def decide(self, query: str, history, add_step) -> Dict[str, Any]:
+        """Manual-ReAct routing: a single SearchRouter.decide call."""
+        return self.router.decide(query)
 
-    # ── main entry ───────────────────────────────────────────────
-    def process(self, user_input: str, on_stage: Optional[Callable] = None) -> Dict[str, Any]:
-        """Route a contract-domain query to the right tool and synthesize an answer."""
+    def _normalize_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Routing rule (ticket 05): 'list all'-style queries whose filter
+        content is rule-expressible (or empty) go to the structured path
+        (contracts_where), never to vector search. Other enumeration queries
+        still hit contract_search, whose service applies its own structured-path
+        routing internally."""
+        if not self._has_where_tool:
+            return decision
+        from apps.search.service import _is_enumeration_query
+        from apps.search.where_sql import _condition_to_sql, enumeration_remainder
+        query = decision.get("query") or ""
+        if _is_enumeration_query(query):
+            remainder = enumeration_remainder(query)
+            if not remainder or _condition_to_sql(remainder) is not None:
+                decision = dict(decision)
+                decision["tool"] = TOOL_CONTRACTS_WHERE
+        return decision
 
-        def _stage(label: str, detail: str = ""):
-            if on_stage:
-                try:
-                    on_stage(label, detail)
-                except Exception:
-                    pass
-
-        self._steps = []
-        query = (user_input or "").strip()
-        if not query:
-            return {
-                "output": "Please enter a contract search query.",
-                "intent": INTENT_CLARIFY,
-                "tool": TOOL_NONE,
-                "tool_calls": [],
-                "steps": self._steps,
-                "success": False,
-                "fallback": False,
-            }
-
-        # ── Step 1: classify the query ──
-        _stage("🧭", "routing...")
-        self._add_step("🧭", "Routing", f"Query: '{query[:60]}'")
-
-        # Hindsight on-demand recall (决策 16/17): 仅命中显式跨会话引用词
-        # (上次/之前/还记得/remember/previously...) 才注入历史记忆; 未命中则静默跳过。
-        agent_input = query
-        if self.hindsight_bank and needs_recall(query):
-            _mem_t0 = time.perf_counter()
-            memories: List[Dict[str, Any]] = []
-            try:
-                memories = hs_recall(query, bank=self.hindsight_bank, max_results=5)
-            except Exception as e:
-                logger.debug("Hindsight recall failed: %s", e)
-            _mem_ms = int((time.perf_counter() - _mem_t0) * 1000)
-            self._add_step(
-                "🧠", "Hindsight memory",
-                "recall on '%s' (%d memories, %dms)" % (query[:40], len(memories), _mem_ms),
-            )
-            if memories:
-                lines = []
-                for m in memories:
-                    content = str(m.get("content") or "").strip()
-                    if content:
-                        lines.append("- " + content)
-                if lines:
-                    agent_input = (
-                        query
-                        + "\n\n[Relevant cross-session memories (Hindsight bank %s)]:\n%s\n"
-                          "[Use these memories if relevant; ignore otherwise.]"
-                        % (self.hindsight_bank, "\n".join(lines))
-                    )
-
-        # Original routing logic (preserved from HEAD):
-        # - fallback detection via raw LLM output presence
-        # - risk tool → contract search degradation when risk tool is not wired
-        # - contracts_where routing for enumeration queries (ticket 05)
-        decision = self.router.decide(agent_input)
-        intent = decision.get("intent", INTENT_CLARIFY)
-        tool = decision.get("tool", TOOL_CONTRACT_SEARCH)
-        retrieval_query = decision.get("query") or agent_input
-        filters = decision.get("filters") or {}
-        used_fallback = not bool(decision.get("raw"))
-        if self._has_where_tool:
-            # Routing rule (ticket 05): "list all"-style queries whose filter
-            # content is rule-expressible (or empty) go to the structured
-            # path (contracts_where), never to vector search. Other
-            # enumeration queries still hit contract_search, whose service
-            # applies its own structured-path routing internally.
-            from apps.search.service import _is_enumeration_query
-            from apps.search.where_sql import _condition_to_sql, enumeration_remainder
-            if _is_enumeration_query(query):
-                remainder = enumeration_remainder(query)
-                if not remainder or _condition_to_sql(remainder) is not None:
-                    tool = TOOL_CONTRACTS_WHERE
-        self._add_step("🧭", "Routing", f"intent={intent}, tool={tool}")
-
-        # ── Step 2: clarify / no-search → answer directly ──
-        if not decision.get("search", True) or tool == TOOL_NONE:
-            clarification = decision.get("clarification_question") or "Please provide more details."
-            self._add_step("💬", "Clarify", clarification[:60])
-            return {
-                "output": clarification,
-                "intent": INTENT_CLARIFY,
-                "tool": TOOL_NONE,
-                "tool_calls": [],
-                "steps": self._steps,
-                "success": True,
-                "fallback": used_fallback,
-            }
-
-        # ── Step 3: run the chosen tool ──
-        tool_calls: List[Dict[str, Any]] = []
-        observation = ""
-        try:
-            if tool == TOOL_CONTRACTS_WHERE and self._has_where_tool:
-                _stage("🔍", f"contracts_where... condition: {retrieval_query}")
-                observation = self.where_tool(retrieval_query)
-                self._add_step("🔍", "contracts_where", f"Condition: '{retrieval_query}'")
-                tool_calls.append({"tool": TOOL_CONTRACTS_WHERE,
-                                   "tool_input": retrieval_query,
-                                   "filters": {},
-                                   "observation": observation[:200]})
-            else:
-                _stage("🔍", f"contract_search... query: {retrieval_query}")
-                observation = self.contract_tool(retrieval_query, filters)
-                self._add_step("🔍", "contract_search", f"Query: '{retrieval_query}'")
-                tool_calls.append({"tool": TOOL_CONTRACT_SEARCH,
-                                   "tool_input": retrieval_query,
-                                   "filters": filters,
-                                   "observation": observation[:200]})
-        except Exception as e:
-            logger.warning("Agent tool failed: %s", e)
-            self._add_step("⚠️", "Tool error", str(e)[:100])
-            return {
-                "output": f"I could not complete the search: {e}",
-                "intent": intent,
-                "tool": tool,
-                "tool_calls": tool_calls,
-                "steps": self._steps,
-                "success": False,
-                "fallback": True,
-            }
-
-        # ── Step 4: synthesize the answer ──
-        _stage("✨", "generating answer...")
-        self._add_step("✨", "Answer generation", "Combining results")
-        output = self._synthesize(query, tool, observation)
-
-        return {
-            "output": output,
-            "intent": intent,
-            "tool": tool,
-            "tool_calls": tool_calls,
-            "steps": self._steps,
-            "success": True,
-            "fallback": used_fallback,
-        }
+    def _summarize(self, query: str, tool: str, observation: str) -> str:
+        return self._synthesize(query, tool, observation)
 
     # ── answer synthesis (LLM with deterministic fallback) ───────
     def _synthesize(self, query: str, tool: str, observation: str) -> str:

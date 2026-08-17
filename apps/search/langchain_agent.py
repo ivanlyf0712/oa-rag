@@ -63,6 +63,7 @@ from apps.search.intents import (
     default_decision,
     infer_intent_from_query,
 )
+from apps.search.agent_core import AgentCore, _missing_contract_tool
 from apps.search.synthesis import AnswerSynthesizer
 from apps.search.router import SearchRouter
 from apps.search.service import _looks_like_ref_no
@@ -95,15 +96,6 @@ class AgentConfigError(RuntimeError):
 # Primary provider: LiteLLM proxy (LITELLM_* env, default dseek-v4-flash).
 ContractTool = Callable[[str, Dict[str, str]], str]
 RiskTool = Callable[[str], str]
-
-_DEFAULT_CLARIFICATION = (
-    "Could you narrow down which contract, counterparty, or risk area you mean?"
-)
-
-
-def _missing_contract_tool(query: str, filters: Dict[str, str]) -> str:
-    raise RuntimeError("contract_search tool is not configured")
-
 
 from apps.search.status_labels import STATUS_ALIASES as _SHARED_STATUS_ALIASES
 from apps.search.filters import (
@@ -552,7 +544,8 @@ def _notifying_tool(tool, on_tool_callback=None, tool_meta_log=None):
     return StructuredTool.from_function(func=_run, name=tool.name, description=tool.description,
                                         args_schema=tool.args_schema)
 
-class LangChainAgent:
+
+class LangChainAgent(AgentCore):
     """LangChain tool-calling agent over the unified contract search pipeline.
 
     Candidate 2: risk/compliance screening is handled inside the unified
@@ -591,23 +584,21 @@ class LangChainAgent:
         profile: Any = None,
         hindsight_bank: Optional[str] = None,
     ):
-        self.contract_tool: ContractTool = contract_tool or _missing_contract_tool
+        # Shared orchestration state (Candidate 1): contract_tool, where_tool,
+        # profile, hindsight_bank, clarification, steps live on AgentCore.
+        super().__init__(contract_tool=contract_tool, where_tool=where_tool,
+                         profile=profile, hindsight_bank=hindsight_bank)
         # Candidate 2: risk queries route to the unified contract_search tool;
         # risk scoring/ranking happens inside the search service. The risk_tool
         # parameter is accepted for backward compatibility but ignored.
         self._llm = llm
         self._api_base = api_base
         self._model = model
-        self.profile = profile
-        # Hindsight 记忆银行 ID; None/空 → 不做跨会话记忆 recall
-        self.hindsight_bank = hindsight_bank or os.getenv("HINDSIGHT_BANK_ID") or None
         self.router = router or SearchRouter(api_base=api_base, model=model or LITELLM_MODEL)
         self._synthesize = synthesize or self._default_synthesize
-        self._has_where_tool = where_tool is not None
         self._tools = build_langchain_tools(
             self.contract_tool, where_tool=where_tool)
         self._tool_map = {t.name: t for t in self._tools}
-        self._steps: List[Dict[str, Any]] = []
         # LangGraph ReAct agent (lazy-initialized)
         self._react_agent: Optional[Any] = None
         # Per-request tool-execution callback (UI progress)
@@ -616,9 +607,6 @@ class LangChainAgent:
         self._tool_meta_log: List[Dict[str, Any]] = []
         # Synthesis deep module (Candidate 3), built lazily around the LLM.
         self._synthesizer: Optional[AnswerSynthesizer] = None
-
-    def _add_step(self, icon: str, label: str, detail: str = "") -> None:
-        self._steps.append({"icon": icon, "label": label, "detail": detail})
 
     def _get_synthesizer(self) -> AnswerSynthesizer:
         """Return the shared AnswerSynthesizer, rebuilding if the LLM changed.
@@ -647,20 +635,6 @@ class LangChainAgent:
             return None
         return self._llm
 
-    def _result(self, *, output, intent, tool, tool_calls, success, fallback,
-                clarify, observation) -> Dict[str, Any]:
-        return {
-            "output": output,
-            "intent": intent,
-            "tool": tool,
-            "tool_calls": tool_calls,
-            "steps": self._steps,
-            "success": success,
-            "fallback": fallback,
-            "clarify": clarify,
-            "observation": observation,
-        }
-
     def _default_synthesize(self, query: str, tool: str, observation: str) -> str:
         """Produce a concise overall summary of the retrieved evidence.
 
@@ -675,6 +649,32 @@ class LangChainAgent:
     def _fallback_summary(observation: str) -> str:
         """Deterministic no-LLM summary (delegates to the synthesis module)."""
         return AnswerSynthesizer.fallback_summary(observation)
+
+    # ── Candidate 1: shared-core seams ───────────────────────────
+    def _summarize(self, query: str, tool: str, observation: str) -> str:
+        return self._synthesize(query, tool, observation)
+
+    def _prepare_filters(self, retrieval_query: str, query: str,
+                         filters: Dict[str, Any]) -> Dict[str, Any]:
+        """Enrich filters with deterministic inference (this engine's extra)."""
+        inferred = self._infer_contract_filters(retrieval_query) or \
+            self._infer_contract_filters(query)
+        for key, value in (inferred or {}).items():
+            filters.setdefault(key, value)
+        return filters
+
+    def _normalize_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Collapse the decision's tool to one this engine can execute: an
+        unavailable contracts_where, or any unknown tool, falls back to the
+        unified contract_search."""
+        tool = decision.get("tool") or TOOL_CONTRACT_SEARCH
+        if tool == TOOL_CONTRACTS_WHERE and not self._has_where_tool:
+            tool = TOOL_CONTRACT_SEARCH
+        if tool not in (TOOL_CONTRACT_SEARCH, TOOL_CONTRACTS_WHERE):
+            tool = TOOL_CONTRACT_SEARCH
+        decision = dict(decision)
+        decision["tool"] = tool
+        return decision
 
     # ── main entry ─────────────────────────────────────────────
     def process(self, user_input: str, on_stage: Optional[Callable] = None,
@@ -1012,51 +1012,18 @@ class LangChainAgent:
         warning banner); fast-route passes False since routing itself did not
         need the LLM."""
         intent = decision.get("intent", INTENT_GENERAL)
+        decision = self._normalize_decision(decision)
         tool = decision.get("tool") or TOOL_CONTRACT_SEARCH
-        if tool == TOOL_CONTRACTS_WHERE and not self._has_where_tool:
-            tool = TOOL_CONTRACT_SEARCH
-        if tool not in (TOOL_CONTRACT_SEARCH, TOOL_CONTRACTS_WHERE):
-            tool = TOOL_CONTRACT_SEARCH
         retrieval_query = decision.get("query") or query
         filters = decision.get("filters") or {}
         self._add_step("router", "Routing", "intent=%s, tool=%s" % (intent, tool))
 
         if not decision.get("search", True) or tool == TOOL_NONE:
-            clarification = decision.get("clarification_question") or _DEFAULT_CLARIFICATION
-            self._add_step("💬", "Clarify", clarification[:60])
-            return self._result(
-                output=clarification, intent=intent, tool=TOOL_NONE, tool_calls=[],
-                success=True, fallback=fallback, clarify=True, observation="",
-            )
+            clarification = decision.get("clarification_question") or self._clarification
+            return self._clarify_result(clarification, intent, fallback)
 
-        observation = ""
-        tool_calls: List[Dict[str, Any]] = []
-        try:
-            # Candidate 2: risk intent routes to the unified contract_search
-            # tool (the service extracts risk filters/ranking); contracts_where
-            # is dispatched inside the ReAct loop, not on this fallback path.
-            _stage("contract", "contract_search... query: %s" % retrieval_query)
-            filters = dict(filters)
-            inferred = self._infer_contract_filters(retrieval_query) or self._infer_contract_filters(query)
-            for key, value in inferred.items():
-                filters.setdefault(key, value)
-            observation = self.contract_tool(retrieval_query, filters)
-            self._add_step("search", "contract_search", "Query: '%s'" % retrieval_query)
-            tool_calls.append({"tool": TOOL_CONTRACT_SEARCH, "tool_input": retrieval_query,
-                               "filters": filters, "observation": observation[:200]})
-        except Exception as e:
-            logger.warning("LangChain agent tool failed: %s", e)
-            self._add_step("warn", "Tool error", str(e)[:100])
-            return self._result(
-                output="I could not complete the search: %s" % e, intent=intent,
-                tool=tool, tool_calls=tool_calls, success=False, fallback=True,
-                clarify=False, observation=observation,
-            )
-
-        _stage("answer", "generating answer...")
-        self._add_step("answer", "Answer generation", "Combining results")
-        output = self._synthesize(query, tool, observation)
-        return self._result(
-            output=output, intent=intent, tool=tool, tool_calls=tool_calls,
-            success=True, fallback=fallback, clarify=False, observation=observation,
-        )
+        # Candidate 2: risk intent routes to the unified contract_search tool
+        # (the service extracts risk filters/ranking); contracts_where is
+        # dispatched inside the ReAct loop, not on this fallback path.
+        return self._run_tool(query, retrieval_query, tool, filters, intent,
+                              fallback, _stage)
