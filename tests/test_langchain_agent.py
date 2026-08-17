@@ -175,12 +175,44 @@ def test_risk_query_invokes_unified_contract_tool(agent, tools):
     out = agent.process("show contracts where risk was not accepted")
     assert out["tool"] == TOOL_CONTRACT_SEARCH
     assert out["intent"] == INTENT_RISK
-    assert tools.contract_calls and not tools.risk_calls
 
 
-def test_normal_search_is_default_tool(agent):
+# ── Fast-route comparative gate ─────────────────────────────────
+@pytest.mark.parametrize(
+    "query",
+    [
+        "compare risk-not-accepted contracts across departments",
+        "risk not accepted vs accepted counts",
+        "why was risk not accepted",
+        "how many risk not accepted contracts by month",
+    ],
+)
+def test_fast_route_yields_comparative_risk(agent, query):
+    # Analytical/comparative risk queries are not certain single-tool calls, so
+    # the fast path must yield (None) and let the ReAct engine handle them.
+    assert agent._fast_route(query) is None
+
+
+def test_fast_route_keeps_pure_risk(agent):
+    # A pure risk retrieval stays on the fast path (guards against over-yield).
+    decision = agent._fast_route("risk not accepted contracts")
+    assert decision is not None
+    assert decision["tool"] == TOOL_CONTRACT_SEARCH
+    assert decision["intent"] == INTENT_RISK
+
+
+def test_fast_route_keeps_bare_ref(agent):
+    # The bare ref-number branch is untouched by the comparative gate.
+    decision = agent._fast_route("CCA20250096")
+    assert decision is not None
+    assert decision["tool"] == TOOL_CONTRACT_SEARCH
+    assert decision["intent"] == INTENT_GENERAL
+
+
+def test_normal_search_is_default_tool(agent, tools):
     out = agent.process("show breach clauses")
     assert out["tool"] == TOOL_CONTRACT_SEARCH
+    assert tools.contract_calls and not tools.risk_calls
 
 
 def test_clarify_calls_no_tool(agent, tools):

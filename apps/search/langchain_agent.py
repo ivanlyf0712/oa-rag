@@ -155,6 +155,24 @@ _GREETING_PATTERNS = (
 )
 
 
+# ── Analytical / comparative signals ─────────────────────────────
+# A risk query carrying any of these is not a certain single-tool call (it may
+# need multi-step reasoning or aggregation the deterministic fast path cannot
+# do), so _fast_route must yield to the ReAct engine. Pure retrievals carry none
+# of these and keep fast-routing.
+_ANALYTICAL_SIGNALS = (
+    "compare", "vs", "versus", "trend", "over time", "why", "how many",
+    "breakdown", "summarize", "average", "total", "group by",
+    "most", "highest",
+)
+
+
+def _looks_analytical(query: str) -> bool:
+    """True when the query carries a comparative/aggregate signal."""
+    text = (query or "").strip().lower()
+    return any(sig in text for sig in _ANALYTICAL_SIGNALS)
+
+
 # ─────────────────────────────────────────────────────────────────────
 # LangChain tool adapters
 # ─────────────────────────────────────────────────────────────────────
@@ -753,6 +771,10 @@ class LangChainAgent(AgentCore):
         """
         intent = infer_intent_from_query(query)
         if intent == INTENT_RISK:
+            # Comparative/aggregate risk queries are not certain single-tool
+            # calls; yield to the ReAct engine. Pure risk retrievals fast-route.
+            if _looks_analytical(query):
+                return None
             tool = TOOL_CONTRACT_SEARCH
         elif _looks_like_ref_no(query):
             tool = TOOL_CONTRACT_SEARCH
