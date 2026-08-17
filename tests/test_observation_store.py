@@ -239,15 +239,19 @@ def test_default_synthesize_empty_observation():
         "No matching contracts were found."
 
 
-def test_unified_system_prompt_when_no_risk_tool():
+def test_unified_system_prompt_is_always_used():
+    # Candidate 2: there is no separate risk tool, so the unified prompt is
+    # always used regardless of whether a (deprecated) risk_tool is passed.
     from apps.search.langchain_agent import LangChainAgent
 
     agent = LangChainAgent(contract_tool=lambda q, f: "", llm=_CaptureLLM())
     assert "risk filters and risk ranking are extracted automatically" in \
         agent._decision_system()
+    assert "call risk_search" not in agent._decision_system()
+    # passing a legacy risk_tool no longer switches the prompt
     agent_with_risk = LangChainAgent(contract_tool=lambda q, f: "",
                                      risk_tool=lambda q: "", llm=_CaptureLLM())
-    assert "call risk_search" in agent_with_risk._decision_system()
+    assert agent_with_risk._decision_system() == agent._decision_system()
 
 
 # -- app wiring -------------------------------------------------------------

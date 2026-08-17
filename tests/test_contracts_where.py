@@ -249,7 +249,6 @@ def test_langchain_tools_register_contracts_where():
     calls = []
     tools = build_langchain_tools(
         contract_tool=lambda q, f: "obs",
-        risk_tool=None,
         where_tool=lambda c: calls.append(c) or "where-obs",
     )
     names = [t.name for t in tools]

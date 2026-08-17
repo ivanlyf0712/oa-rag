@@ -60,7 +60,6 @@ from apps.search.intents import (
     TOOL_CONTRACT_SEARCH,
     TOOL_CONTRACTS_WHERE,
     TOOL_NONE,
-    TOOL_RISK_SEARCH,
     default_decision,
     infer_intent_from_query,
 )
@@ -104,10 +103,6 @@ _DEFAULT_CLARIFICATION = (
 
 def _missing_contract_tool(query: str, filters: Dict[str, str]) -> str:
     raise RuntimeError("contract_search tool is not configured")
-
-
-def _missing_risk_tool(query: str) -> str:
-    raise RuntimeError("risk_search tool is not configured")
 
 
 from apps.search.status_labels import STATUS_ALIASES as _SHARED_STATUS_ALIASES
@@ -173,14 +168,14 @@ _GREETING_PATTERNS = (
 # ─────────────────────────────────────────────────────────────────────
 def build_langchain_tools(
     contract_tool: ContractTool,
-    risk_tool: Optional[RiskTool] = None,
     where_tool: Optional[Callable[[str], str]] = None,
 ) -> List[Any]:
     """Wrap the raw callables as LangChain @tool objects.
 
     Kept separate from the agent so the tools can be built/inspected/tested
     independently. Each tool returns the observation as a plain string so it
-    can be surfaced in the UI as evidence.
+    can be surfaced in the UI as evidence. Candidate 2: there is no separate
+    risk tool; risk is handled inside the unified contract_search service.
     """
     from langchain_core.tools import tool
 
@@ -247,19 +242,10 @@ def build_langchain_tools(
 
         tools.append(contracts_where)
 
-    if risk_tool is not None:
-        @tool(TOOL_RISK_SEARCH)
-        def risk_search(query: str) -> str:
-            """Screen contracts for risk / compliance flags.
-
-            Use ONLY when the query is explicitly about contract risk, e.g. risk not
-            accepted, needs legal/GFN review, over value threshold (Over5M/Over100M),
-            external guarantees, related-party/data/capex, unlimited liability, or
-            incomplete documentation.
-            """
-            return risk_tool(query)
-
-        tools.append(risk_search)
+    # Candidate 2: no separate risk_search tool. Risk/compliance screening is
+    # handled by the unified contract_search tool (the service extracts risk
+    # filters and ranks every candidate set by risk), so the LLM is always
+    # offered a single search entry point.
 
     return tools
 
@@ -567,14 +553,18 @@ def _notifying_tool(tool, on_tool_callback=None, tool_meta_log=None):
                                         args_schema=tool.args_schema)
 
 class LangChainAgent:
-    """LangChain tool-calling agent routing between contract and risk search.
+    """LangChain tool-calling agent over the unified contract search pipeline.
+
+    Candidate 2: risk/compliance screening is handled inside the unified
+    contract_search service, so there is no separate risk tool.
 
     Parameters
     ----------
     contract_tool:
         The existing contract retrieval callable (see apps/search_cli.py builder).
     risk_tool:
-        Optional risk search callable (see build_risk_tool in search_cli.py).
+        Deprecated/ignored. Accepted for backward compatibility; risk queries
+        route to the unified contract_search tool.
     llm:
         Any LangChain chat model. If omitted, build_default_llm() is built
         lazily on the first process() call.
@@ -602,8 +592,9 @@ class LangChainAgent:
         hindsight_bank: Optional[str] = None,
     ):
         self.contract_tool: ContractTool = contract_tool or _missing_contract_tool
-        self._has_risk_tool = risk_tool is not None
-        self.risk_tool: RiskTool = risk_tool or _missing_risk_tool
+        # Candidate 2: risk queries route to the unified contract_search tool;
+        # risk scoring/ranking happens inside the search service. The risk_tool
+        # parameter is accepted for backward compatibility but ignored.
         self._llm = llm
         self._api_base = api_base
         self._model = model
@@ -614,7 +605,7 @@ class LangChainAgent:
         self._synthesize = synthesize or self._default_synthesize
         self._has_where_tool = where_tool is not None
         self._tools = build_langchain_tools(
-            self.contract_tool, risk_tool=self.risk_tool, where_tool=where_tool)
+            self.contract_tool, where_tool=where_tool)
         self._tool_map = {t.name: t for t in self._tools}
         self._steps: List[Dict[str, Any]] = []
         # LangGraph ReAct agent (lazy-initialized)
@@ -753,15 +744,16 @@ class LangChainAgent:
     def _fast_route(self, query: str) -> Optional[Dict[str, Any]]:
         """Keyword-confident routing decision, or None when ambiguous.
 
-        Confident cases:
+        Confident cases (Candidate 2: risk now routes to the unified
+        contract_search tool; the service applies the risk filters/ranking):
         - risk-keyword queries ("risk not accepted", "needs legal review")
-          -> risk_search
+          -> contract_search (risk intent preserved for the rank hint)
         - bare ref-number queries ("CCA20250096")
           -> contract_search (exact ref lookup happens inside the service)
         """
         intent = infer_intent_from_query(query)
         if intent == INTENT_RISK:
-            tool = TOOL_RISK_SEARCH
+            tool = TOOL_CONTRACT_SEARCH
         elif _looks_like_ref_no(query):
             tool = TOOL_CONTRACT_SEARCH
             intent = INTENT_GENERAL
@@ -887,9 +879,12 @@ class LangChainAgent:
 
             last_tool = tool_calls[-1]["tool"]
             self._add_step("🧠", "Routing", "LLM tool calling (ReAct): tool=%s" % last_tool)
+            # Candidate 2: risk intent is inferred from the query, not the tool
+            # (risk queries now route to the unified contract_search tool).
+            intent = INTENT_RISK if infer_intent_from_query(query) == INTENT_RISK else INTENT_GENERAL
             return self._result(
                 output=final_content,
-                intent=INTENT_RISK if last_tool == TOOL_RISK_SEARCH else INTENT_GENERAL,
+                intent=intent,
                 tool=last_tool,
                 tool_calls=tool_calls,
                 success=True,
@@ -942,26 +937,9 @@ class LangChainAgent:
         "Contract types: " + _CTYPE_DESC + ". "
     )
 
-    _DECISION_SYSTEM = (
-        "You are a contract search assistant for a legal/OA system. "
-        "Decide which tool to call for the user's message. "
-        "Rules: "
-        "1) General contract-content questions (clauses, breach, termination, "
-        "liability, amounts, counterparties, renewal/expiry, status, expired, "
-        "contract id) -> call contract_search. This is the DEFAULT tool. "
-        "2) Risk/compliance questions (risk not accepted, needs legal/GFN review, "
-        "over value threshold (Over5M/Over100M), external guarantees, "
-        "related-party/data/capex, unlimited liability, incomplete documentation, "
-        "authority insufficient) -> call risk_search. "
-        "3) When using contract_search, if the query mentions status "
-        "(e.g. completed, active, pending), expired contracts, or a specific "
-        "contract id/ref number, include those values in the filters argument. "
-        "4) " + _STATUS_CTYPE_CLAUSE +
-        "5) Greetings, small talk, or vague/ambiguous messages -> do NOT call any "
-        "tool; instead reply with a short clarifying question. "
-        "Always prefer calling a tool for genuine contract questions."
-    )
-
+    # Candidate 2: single unified prompt (the legacy two-tool _DECISION_SYSTEM
+    # that told the LLM to "call risk_search" is removed; risk is handled by
+    # the unified contract_search tool).
     _DECISION_SYSTEM_UNIFIED = (
         "You are a contract search assistant for a legal/OA system. "
         "Decide whether to call the contract_search tool for the user's message. "
@@ -994,10 +972,14 @@ class LangChainAgent:
     )
 
     def _decision_system(self) -> str:
-        """System prompt for tool selection, matching the wired tools."""
+        """System prompt for tool selection, matching the wired tools.
+
+        Candidate 2: there is no separate risk tool, so the unified prompt is
+        always used; the where-tool variant adds the structured-retrieval rule.
+        """
         if self._has_where_tool:
             return self._DECISION_SYSTEM_WHERE
-        return self._DECISION_SYSTEM if self._has_risk_tool else self._DECISION_SYSTEM_UNIFIED
+        return self._DECISION_SYSTEM_UNIFIED
 
     # Filter vocabulary lives in the dedicated filters module (single source
     # of truth); these are thin back-compat references for existing callers.
@@ -1031,13 +1013,9 @@ class LangChainAgent:
         need the LLM."""
         intent = decision.get("intent", INTENT_GENERAL)
         tool = decision.get("tool") or TOOL_CONTRACT_SEARCH
-        if tool == TOOL_RISK_SEARCH and not self._has_risk_tool:
-            # Risk search is not wired on this agent; degrade to the safe
-            # default (contract search) instead of raising.
-            tool = TOOL_CONTRACT_SEARCH
         if tool == TOOL_CONTRACTS_WHERE and not self._has_where_tool:
             tool = TOOL_CONTRACT_SEARCH
-        if tool not in (TOOL_CONTRACT_SEARCH, TOOL_RISK_SEARCH, TOOL_CONTRACTS_WHERE):
+        if tool not in (TOOL_CONTRACT_SEARCH, TOOL_CONTRACTS_WHERE):
             tool = TOOL_CONTRACT_SEARCH
         retrieval_query = decision.get("query") or query
         filters = decision.get("filters") or {}
@@ -1054,22 +1032,18 @@ class LangChainAgent:
         observation = ""
         tool_calls: List[Dict[str, Any]] = []
         try:
-            if tool == TOOL_RISK_SEARCH:
-                _stage("risk", "risk_search... query: %s" % retrieval_query)
-                observation = self.risk_tool(retrieval_query)
-                self._add_step("search", "risk_search", "Query: '%s'" % retrieval_query)
-                tool_calls.append({"tool": TOOL_RISK_SEARCH, "tool_input": retrieval_query,
-                                   "filters": {}, "observation": observation[:200]})
-            else:
-                _stage("contract", "contract_search... query: %s" % retrieval_query)
-                filters = dict(filters)
-                inferred = self._infer_contract_filters(retrieval_query) or self._infer_contract_filters(query)
-                for key, value in inferred.items():
-                    filters.setdefault(key, value)
-                observation = self.contract_tool(retrieval_query, filters)
-                self._add_step("search", "contract_search", "Query: '%s'" % retrieval_query)
-                tool_calls.append({"tool": TOOL_CONTRACT_SEARCH, "tool_input": retrieval_query,
-                                   "filters": filters, "observation": observation[:200]})
+            # Candidate 2: risk intent routes to the unified contract_search
+            # tool (the service extracts risk filters/ranking); contracts_where
+            # is dispatched inside the ReAct loop, not on this fallback path.
+            _stage("contract", "contract_search... query: %s" % retrieval_query)
+            filters = dict(filters)
+            inferred = self._infer_contract_filters(retrieval_query) or self._infer_contract_filters(query)
+            for key, value in inferred.items():
+                filters.setdefault(key, value)
+            observation = self.contract_tool(retrieval_query, filters)
+            self._add_step("search", "contract_search", "Query: '%s'" % retrieval_query)
+            tool_calls.append({"tool": TOOL_CONTRACT_SEARCH, "tool_input": retrieval_query,
+                               "filters": filters, "observation": observation[:200]})
         except Exception as e:
             logger.warning("LangChain agent tool failed: %s", e)
             self._add_step("warn", "Tool error", str(e)[:100])

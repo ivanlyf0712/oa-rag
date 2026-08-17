@@ -26,7 +26,6 @@ from apps.search.intents import (
     INTENT_RISK,
     TOOL_CONTRACT_SEARCH,
     TOOL_NONE,
-    TOOL_RISK_SEARCH,
 )
 from apps.search.langchain_agent import (
     AgentConfigError,
@@ -116,9 +115,9 @@ ROUTING_SCRIPT = {
     # Order matters: first matching needle wins.
     "contract ID 12345": ("tool", TOOL_CONTRACT_SEARCH,
                           {"query": "show contract ID 12345", "filters": {"contract_id": "12345"}}),
-    "not accepted": ("tool", TOOL_RISK_SEARCH, {"query": "risk not accepted"}),
-    "high risk": ("tool", TOOL_RISK_SEARCH, {"query": "high risk contracts"}),
-    "risk": ("tool", TOOL_RISK_SEARCH, {"query": "risk not accepted"}),
+    "not accepted": ("tool", TOOL_CONTRACT_SEARCH, {"query": "risk not accepted"}),
+    "high risk": ("tool", TOOL_CONTRACT_SEARCH, {"query": "high risk contracts"}),
+    "risk": ("tool", TOOL_CONTRACT_SEARCH, {"query": "risk not accepted"}),
     "liability": ("tool", TOOL_CONTRACT_SEARCH, {"query": "unlimited liability", "filters": {}}),
     "breach": ("tool", TOOL_CONTRACT_SEARCH, {"query": "breach clause", "filters": {}}),
     "Acme": ("tool", TOOL_CONTRACT_SEARCH,
@@ -134,8 +133,8 @@ ROUTING_SCRIPT = {
 GOLDEN_CASES = [
     ("which contracts mention unlimited liability", TOOL_CONTRACT_SEARCH, INTENT_GENERAL),
     ("show breach clauses", TOOL_CONTRACT_SEARCH, INTENT_GENERAL),
-    ("show contracts where risk was not accepted", TOOL_RISK_SEARCH, INTENT_RISK),
-    ("risk not accepted contracts", TOOL_RISK_SEARCH, INTENT_RISK),
+    ("show contracts where risk was not accepted", TOOL_CONTRACT_SEARCH, INTENT_RISK),
+    ("risk not accepted contracts", TOOL_CONTRACT_SEARCH, INTENT_RISK),
     ("what contracts do we have with Acme", TOOL_CONTRACT_SEARCH, INTENT_GENERAL),
     ("which contracts are up for renewal", TOOL_CONTRACT_SEARCH, INTENT_GENERAL),
     ("vague tell me about it", TOOL_NONE, INTENT_CLARIFY),
@@ -151,7 +150,6 @@ def tools():
 def agent(tools):
     return LangChainAgent(
         contract_tool=tools.contract,
-        risk_tool=tools.risk,
         llm=ScriptedLLM(script=ROUTING_SCRIPT),
         synthesize=lambda q, t, o: "ANSWER[%s]: %s" % (t, o),
     )
@@ -171,10 +169,13 @@ def test_contract_query_invokes_only_contract_tool(agent, tools):
     assert tools.contract_calls and not tools.risk_calls
 
 
-def test_risk_query_invokes_only_risk_tool(agent, tools):
+def test_risk_query_invokes_unified_contract_tool(agent, tools):
+    # Candidate 2: risk queries route to the unified contract_search tool (the
+    # service applies risk filters/ranking); the risk intent is preserved.
     out = agent.process("show contracts where risk was not accepted")
-    assert out["tool"] == TOOL_RISK_SEARCH
-    assert tools.risk_calls and not tools.contract_calls
+    assert out["tool"] == TOOL_CONTRACT_SEARCH
+    assert out["intent"] == INTENT_RISK
+    assert tools.contract_calls and not tools.risk_calls
 
 
 def test_normal_search_is_default_tool(agent):

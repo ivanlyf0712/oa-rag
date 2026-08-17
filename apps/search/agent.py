@@ -27,7 +27,6 @@ from apps.search.intents import (
     TOOL_CONTRACT_SEARCH,
     TOOL_CONTRACTS_WHERE,
     TOOL_NONE,
-    TOOL_RISK_SEARCH,
 )
 from apps.search.router import SearchRouter
 from apps.search.synthesis import EMPTY_OBSERVATION_MESSAGE
@@ -43,10 +42,6 @@ RiskTool = Callable[[str], str]
 
 def _missing_contract_tool(query: str, filters: Dict[str, str]) -> str:
     raise RuntimeError("contract_search tool is not configured")
-
-
-def _missing_risk_tool(query: str) -> str:
-    raise RuntimeError("risk_search tool is not configured")
 
 
 class CrossTableAgent:
@@ -78,8 +73,9 @@ class CrossTableAgent:
         self.api_key = api_key or LITELLM_API_KEY
         self.model = model
         self.contract_tool: ContractTool = contract_tool or _missing_contract_tool
-        self._has_risk_tool = risk_tool is not None
-        self.risk_tool: RiskTool = risk_tool or _missing_risk_tool
+        # Candidate 2: risk queries route to the unified contract_search tool;
+        # risk scoring/ranking happens inside the search service. The risk_tool
+        # parameter is accepted for backward compatibility but ignored.
         self._has_where_tool = where_tool is not None
         self.where_tool = where_tool
         self.router = router or SearchRouter(api_base=self.api_base,
@@ -160,11 +156,6 @@ class CrossTableAgent:
         retrieval_query = decision.get("query") or agent_input
         filters = decision.get("filters") or {}
         used_fallback = not bool(decision.get("raw"))
-        if tool == TOOL_RISK_SEARCH and not self._has_risk_tool:
-            # Risk search is not wired on this agent; degrade to the safe
-            # default (contract search) instead of raising.
-            tool = TOOL_CONTRACT_SEARCH
-            used_fallback = True
         if self._has_where_tool:
             # Routing rule (ticket 05): "list all"-style queries whose filter
             # content is rule-expressible (or empty) go to the structured
@@ -202,14 +193,6 @@ class CrossTableAgent:
                 observation = self.where_tool(retrieval_query)
                 self._add_step("🔍", "contracts_where", f"Condition: '{retrieval_query}'")
                 tool_calls.append({"tool": TOOL_CONTRACTS_WHERE,
-                                   "tool_input": retrieval_query,
-                                   "filters": {},
-                                   "observation": observation[:200]})
-            elif tool == TOOL_RISK_SEARCH:
-                _stage("🔍", f"risk_search... query: {retrieval_query}")
-                observation = self.risk_tool(retrieval_query)
-                self._add_step("🔍", "risk_search", f"Query: '{retrieval_query}'")
-                tool_calls.append({"tool": TOOL_RISK_SEARCH,
                                    "tool_input": retrieval_query,
                                    "filters": {},
                                    "observation": observation[:200]})
