@@ -21,6 +21,9 @@ uploads/
 # Real data — never commit
 data/*.csv
 data/*.sql
+# ...but DO ship the fake seed/demo data so users can run the demo
+!data/fake_*.csv
+!data/fake_*.sql
 *.bak
 
 # Internal working docs & AI-assistant session files (kept local)
