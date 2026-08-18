@@ -47,7 +47,7 @@ services:
       HINDSIGHT_API_LLM_PROVIDER: openai
       HINDSIGHT_API_LLM_MODEL: ${LITELLM_MODEL:-dseek-v4-flash}
       HINDSIGHT_API_LLM_API_KEY: ${LITELLM_API_KEY:?LITELLM_API_KEY must be set in .env}
-      HINDSIGHT_API_LLM_BASE_URL: ${LITELLM_BASE_URL:-https://litellm.dchbi.app/}/v1
+      HINDSIGHT_API_LLM_BASE_URL: ${LITELLM_BASE_URL:?LITELLM_BASE_URL must be set in .env}/v1
       HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
       HINDSIGHT_API_RERANKER_PROVIDER: flashrank
       HINDSIGHT_API_WORKER_ID: oa-hindsight-prod
@@ -76,7 +76,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
       DB_CHARSET: ${DB_CHARSET:-utf8mb4}
       LITELLM_API_KEY: ${LITELLM_API_KEY:?LITELLM_API_KEY must be set in .env}
-      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-https://litellm.dchbi.app/}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:?LITELLM_BASE_URL must be set in .env}
       LITELLM_MODEL: ${LITELLM_MODEL:-dseek-v4-flash}
       LITELLM_TIMEOUT: ${LITELLM_TIMEOUT:-45}
       LITELLM_MAX_TOKENS: ${LITELLM_MAX_TOKENS:-2048}
