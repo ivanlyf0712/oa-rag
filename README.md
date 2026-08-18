@@ -48,8 +48,8 @@
 
 ### 方式 A：Docker 一鍵啟動（推薦）/ Docker one-command stack (recommended)
 
-參考 corpchat-rag 的做法，整個堆疊（MySQL 8 + Streamlit app）已容器化：
-Mirroring corpchat-rag, the whole stack (MySQL 8 + Streamlit app) is containerized:
+整個堆疊（MySQL 8 + Streamlit app）已容器化：
+The whole stack (MySQL 8 + Streamlit app) is containerized:
 
 ```bash
 cp .env.example .env      # 填入 DB_* / LITELLM_API_KEY 等 / fill in secrets
@@ -140,8 +140,8 @@ The agent connects to a local Ollama model via the existing LiteLLM-compatible e
 
 | 變數 / Variable | 預設 / Default | 說明 / Description |
 | --- | --- | --- |
-| `LITELLM_BASE_URL` | `https://litellm.dchbi.app/` | LiteLLM 相容代理位址 / LiteLLM-compatible proxy URL |
-| `LITELLM_MODEL` | `dseek-v4-flash` | 用於工具呼叫的模型 / Model used for tool calling |
+| `LITELLM_BASE_URL` | — (required) | LiteLLM 相容代理位址 / LiteLLM-compatible proxy URL |
+| `LITELLM_MODEL` | — (required) | 用於工具呼叫的模型 / Model used for tool calling |
 
 ### 相依套件 / Dependencies
 

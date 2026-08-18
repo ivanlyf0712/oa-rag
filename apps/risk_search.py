@@ -296,8 +296,8 @@ def gate_and_sort(
 # ═══════════════════════════════════════════════════════════════════
 
 _LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
-_LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "https://litellm.dchbi.app/")
-_LITELLM_MODEL = os.getenv("LITELLM_MODEL", "dseek-v4-flash")
+_LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "")
+_LITELLM_MODEL = os.getenv("LITELLM_MODEL", "")
 
 # Explicit risk language → deterministic risky mode without an LLM call.
 _RISK_KEYWORDS = (

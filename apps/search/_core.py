@@ -109,8 +109,8 @@ LLM_KEYWORD_QUERY_WEIGHT = 1.0
 # 密钥必须从环境变量提供, 不硬编码。所有 LLM 调用统一经由
 # apps/search/litellm_client.py 的 LiteLLMClient 发出。
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
-LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "https://litellm.dchbi.app").rstrip("/")
-LITELLM_MODEL = os.getenv("LITELLM_MODEL", "dseek-v4-flash")
+LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "").rstrip("/")
+LITELLM_MODEL = os.getenv("LITELLM_MODEL", "")
 # 单次请求超时 (秒): 代理峰值延迟实测可达 ~40s, 默认 90s 留足余量。
 # 45s default (was 90): fail faster when the shared proxy stalls, so
 # the router fallback kicks in sooner. Override via LITELLM_TIMEOUT env.

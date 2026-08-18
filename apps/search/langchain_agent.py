@@ -96,7 +96,7 @@ class AgentConfigError(RuntimeError):
     """Raised when the LangChain agent cannot be configured."""
 
 
-# Primary provider: LiteLLM proxy (LITELLM_* env, default dseek-v4-flash).
+# Primary provider: LiteLLM proxy (LITELLM_* env).
 ContractTool = Callable[[str, Dict[str, str]], str]
 RiskTool = Callable[[str], str]
 

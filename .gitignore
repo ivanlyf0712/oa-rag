@@ -22,3 +22,12 @@ uploads/
 data/*.csv
 data/*.sql
 *.bak
+
+# Internal working docs & AI-assistant session files (kept local)
+.scratch/
+AGENTS.md
+CLAUDE.md
+docs/CONTEXT.md
+docs/adr/
+docs/agents/
+_test*.py
